@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV LOGISTICS_DB=/data/logistics.db \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 RUN chmod +x /app/scripts/entrypoint.sh
 

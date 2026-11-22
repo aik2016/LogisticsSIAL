@@ -14,6 +14,27 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 
 Open http://127.0.0.1:8000 on the **same computer**. Set `LOGISTICS_DB` to choose a database path. Set `COOKIE_SECURE=1` behind HTTPS. To enable email password reset, configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_USER`, `SMTP_PASSWORD`, and `APP_BASE_URL` as host environment variables. Do not commit those credentials. API documentation is at `/docs` after sign in.
 
+## Deploy on Railway (trial)
+
+This repo ships a `Dockerfile` and `railway.toml`. Railway must **not** use `uvicorn main:app` unless `main.py` is present (it re-exports `app`).
+
+1. Connect the GitHub repo and deploy from the **Dockerfile** (preferred) so `poppler-utils` is available for PDF text extraction.
+2. Add a **Volume** mounted at `/data` so SQLite survives redeploys.
+3. Set variables in Railway:
+
+| Variable | Example | Purpose |
+| --- | --- | --- |
+| `LOGISTICS_DB` | `/data/logistics.db` | Database file on the volume |
+| `COOKIE_SECURE` | `1` | Secure session cookie over HTTPS |
+| `APP_BASE_URL` | `https://your-app.up.railway.app` | Password-reset links (if SMTP is set) |
+| `ADMIN_USERNAME` | `admin` | First boot only, when no users exist |
+| `ADMIN_PASSWORD` | *(secret)* | First boot only |
+| `ADMIN_EMAIL` | `you@company.com` | Optional, for recovery metadata |
+
+4. After the first successful deploy, remove or rotate `ADMIN_PASSWORD` in Railway if you prefer not to keep it in env vars.
+
+If you use Nixpacks instead of Docker, set the start command to `uvicorn app:app --host 0.0.0.0 --port $PORT` (or use the `Procfile`).
+
 ## Admin first-use order
 
 1. Create the admin account with `python manage.py create-admin` before starting the server.

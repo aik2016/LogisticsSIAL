@@ -35,7 +35,8 @@ def hash_password(password, salt=None):
 def verify(password, stored):
     try:
         salt_hex,digest=stored.split(':')
-        check=hash_password(password,bytes.fromhex(salt_hex)).split(':')[1]
+        salt=bytes.fromhex(salt_hex)
+        check=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,600_000).hex()
         return secrets.compare_digest(check,digest)
     except (ValueError,AttributeError): return False
 

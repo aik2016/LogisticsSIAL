@@ -1,0 +1,5 @@
+#!/bin/sh
+# Remove Cursor agent trailers before the commit is recorded.
+tmp=$(mktemp 2>/dev/null || mktemp -t commitmsg)
+grep -viE '^(co-authored-by: cursor|made-with: cursor)' "$1" >"$tmp" && mv "$tmp" "$1"
+exit 0

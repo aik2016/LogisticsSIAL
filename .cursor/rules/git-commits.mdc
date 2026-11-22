@@ -1,0 +1,13 @@
+---
+description: Git commits must credit Salah only; never add Cursor co-author trailers.
+alwaysApply: true
+---
+
+# Git commits (Salah / salahalsuheme)
+
+When creating git commits for this repository:
+
+- Use author identity: **Salah Alsuheme** with email **salah.alsuheme@hotmail.com**.
+- **Never** add `Co-authored-by: Cursor`, `Made-with: Cursor`, or any Cursor agent attribution to commit messages.
+- Do **not** run `git commit` with `--author` pointing at other accounts unless the user explicitly requests another identity.
+- Prefer plain commit messages with no co-author trailers.

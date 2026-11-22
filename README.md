@@ -2,6 +2,8 @@
 
 Private prototype for Sial's PO, inventory, invoice and Nupco workflows. See [SOURCE_NOTES.md](SOURCE_NOTES.md) for the supplied workbook mapping and data quality findings.
 
+**Hosting:** The repository is prepared to deploy on **[Railway](https://railway.app)** (Dockerfile, `railway.toml`, volume-backed SQLite, and first-admin bootstrap). Use the [Deploy on Railway](#deploy-on-railway-trial) steps below. That is trial hosting only; the app is still a prototype, not full production.
+
 ## Run locally
 
 ```bash
@@ -15,6 +17,8 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 Open http://127.0.0.1:8000 on the **same computer**. Set `LOGISTICS_DB` to choose a database path. Set `COOKIE_SECURE=1` behind HTTPS. To enable email password reset, configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_USER`, `SMTP_PASSWORD`, and `APP_BASE_URL` as host environment variables. Do not commit those credentials. API documentation is at `/docs` after sign in.
 
 ## Deploy on Railway (trial)
+
+Hosting is set up for Railway: connect this repo, build from the **Dockerfile**, and use the environment variables in the table below.
 
 This repo ships a `Dockerfile` and `railway.toml`. Railway must **not** use `uvicorn main:app` unless `main.py` is present (it re-exports `app`).
 

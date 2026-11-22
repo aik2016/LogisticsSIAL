@@ -18,4 +18,5 @@ RUN chmod +x /app/scripts/entrypoint.sh
 
 EXPOSE 8080
 
-CMD ["/app/scripts/entrypoint.sh"]
+# Railway routes traffic to $PORT; CMD must not hard-code 8000.
+CMD ["/bin/sh", "/app/scripts/entrypoint.sh"]

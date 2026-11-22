@@ -39,6 +39,15 @@ This repo ships a `Dockerfile` and `railway.toml`. Railway must **not** use `uvi
 
 If you use Nixpacks instead of Docker, set the start command to `uvicorn app:app --host 0.0.0.0 --port $PORT` (or use the `Procfile`).
 
+### "Application failed to respond" on Railway
+
+Usually the process is not listening on Railway's `$PORT`.
+
+1. **Settings → Deploy → Custom Start Command** must be **empty** (use `railway.toml` / Dockerfile `entrypoint.sh`).
+2. Do **not** use `uvicorn ... --port 8000` alone; the start script already binds `0.0.0.0:$PORT`.
+3. Open **Deploy Logs** and confirm a line like `logistics: db=/data/logistics.db port=...` then `Uvicorn running on http://0.0.0.0:...`.
+4. Ensure the **volume** is mounted at `/data` and `LOGISTICS_DB=/data/logistics.db`.
+
 ## Admin first-use order
 
 1. Create the admin account with `python manage.py create-admin` before starting the server.

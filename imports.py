@@ -145,6 +145,8 @@ NUPCO_LAYOUTS = {
 with db() as c:
     if 'value' not in [r['name'] for r in c.execute('PRAGMA table_info(source_status)')]:
         c.execute('ALTER TABLE source_status ADD COLUMN value REAL')
+    if 'stage' not in [r['name'] for r in c.execute('PRAGMA table_info(source_status)')]:
+        c.execute("ALTER TABLE source_status ADD COLUMN stage TEXT DEFAULT ''")
     c.execute('''CREATE TABLE IF NOT EXISTS nupco_records (id INTEGER PRIMARY KEY, source_name TEXT NOT NULL,
       kind TEXT NOT NULL, source_row INTEGER NOT NULL, po_number TEXT DEFAULT '', po_line TEXT DEFAULT '',
       document_number TEXT DEFAULT '', supplier_reference TEXT DEFAULT '', status TEXT DEFAULT '',

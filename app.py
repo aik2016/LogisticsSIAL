@@ -56,12 +56,22 @@ def init_db():
         CREATE TABLE IF NOT EXISTS po_status_events (id INTEGER PRIMARY KEY, po_id INTEGER NOT NULL REFERENCES pos(id), status TEXT NOT NULL, reason TEXT DEFAULT '', user_id INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS invoice_number_transfers (id INTEGER PRIMARY KEY, number TEXT NOT NULL, from_po_id INTEGER NOT NULL, to_po_id INTEGER NOT NULL, user_id INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS po_remaining_snapshot (po_id INTEGER NOT NULL REFERENCES pos(id), item_code TEXT NOT NULL, remaining_qty INTEGER NOT NULL CHECK(remaining_qty>=0), source_name TEXT NOT NULL, PRIMARY KEY(po_id,item_code));
+        CREATE TABLE IF NOT EXISTS regional_po_rows (id INTEGER PRIMARY KEY, source_name TEXT NOT NULL, sheet TEXT NOT NULL, row_number INTEGER NOT NULL, po_number TEXT NOT NULL, region TEXT NOT NULL, status TEXT DEFAULT '', invoice_reference TEXT DEFAULT '', asn_number TEXT DEFAULT '', asn_date TEXT DEFAULT '', item_text TEXT DEFAULT '', planned_qty TEXT DEFAULT '', left_qty TEXT DEFAULT '', due_date TEXT DEFAULT '', address TEXT DEFAULT '', customer_po TEXT DEFAULT '', UNIQUE(source_name,sheet,row_number));
+        CREATE TABLE IF NOT EXISTS po_invoice_numbers (po_id INTEGER PRIMARY KEY REFERENCES pos(id), number TEXT NOT NULL UNIQUE, assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, assigned_by INTEGER);
         ''')
         if 'address' not in [r['name'] for r in c.execute('PRAGMA table_info(po_lines)')]:
             c.execute("ALTER TABLE po_lines ADD COLUMN address TEXT DEFAULT ''")
         for column,definition in [('invoice_status',"TEXT DEFAULT 'rcv_needed'"),('marketplace_status',"TEXT DEFAULT ''"),('marketplace_reason',"TEXT DEFAULT ''"),('archived',"INTEGER DEFAULT 0"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''")]:
             if column not in [r['name'] for r in c.execute('PRAGMA table_info(pos)')]:
                 c.execute(f'ALTER TABLE pos ADD COLUMN {column} {definition}')
+        if 'reference_number' not in [r['name'] for r in c.execute('PRAGMA table_info(invoices)')]:
+            c.execute("ALTER TABLE invoices ADD COLUMN reference_number TEXT DEFAULT ''")
+            c.execute("UPDATE invoices SET reference_number=number WHERE reference_number='' OR reference_number IS NULL")
+        if 'sha256' not in [r['name'] for r in c.execute('PRAGMA table_info(po_documents)')]:
+            c.execute("ALTER TABLE po_documents ADD COLUMN sha256 TEXT DEFAULT ''")
+        for column,definition in [('created_by','INTEGER'),('task_type',"TEXT DEFAULT ''"),('invoice_number',"TEXT DEFAULT ''"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''"),('asn_remarks',"TEXT DEFAULT ''"),('submitted_at','TEXT'),('reviewed_at','TEXT')]:
+            if column not in [r['name'] for r in c.execute('PRAGMA table_info(tasks)')]:
+                c.execute(f'ALTER TABLE tasks ADD COLUMN {column} {definition}')
         # Apply family defaults only to items whose pallet size is still unknown.
         c.execute("UPDATE items SET boxes_per_pallet=14 WHERE boxes_per_pallet=0 AND code LIKE 'RIMZP-%'")
         c.execute("UPDATE items SET boxes_per_pallet=9 WHERE boxes_per_pallet=0 AND (code LIKE 'RIM-%' OR code LIKE 'RIB-%')")
@@ -190,6 +200,9 @@ def dashboard_data():
           (SELECT ss.status FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_status,
           (SELECT ss.invoice_status FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_invoice_status,
           (SELECT ss.remaining_detail FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_remaining,
+          (SELECT ss.invoice_reference FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_invoice_reference,
+          (SELECT ss.remarks FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_remarks,
+          (SELECT ss.stage FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_stage,
           COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE i.po_id=p.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
           FROM pos p LEFT JOIN po_lines l ON l.po_id=p.id GROUP BY p.id ORDER BY due_date''')
         for p in pos:
@@ -207,6 +220,8 @@ def dashboard_data():
         invoices = rows(c, '''SELECT i.*,p.number po_number,
           COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il WHERE il.invoice_id=i.id),0) quantity
           FROM invoices i JOIN pos p ON p.id=i.po_id ORDER BY i.id DESC''')
+        region_rows=rows(c,'''SELECT r.* FROM regional_po_rows r WHERE r.source_name=
+          (SELECT source_name FROM regional_po_rows ORDER BY id DESC LIMIT 1) ORDER BY po_number,row_number''')
         due_lines = rows(c, '''SELECT p.id po_id,p.number,p.customer,p.customer_po,p.region,p.value,p.status,p.overdue_reason,
            l.id,l.line_no,l.item_code,l.quantity,l.quantity ordered_qty,l.due_date,
            COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
@@ -235,6 +250,8 @@ def dashboard_data():
                 'lines':rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date'),
                 'reminders':reminders, 'urgent':urgent,
                 'documents':rows(c,'SELECT d.id,d.po_id,d.filename,d.uploaded_at FROM po_documents d ORDER BY d.id DESC'),
+                'regional_rows':region_rows,
+                'assigned_invoice_numbers':rows(c,'SELECT n.po_id,n.number FROM po_invoice_numbers n'),
                 'status_options':rows(c,'SELECT key,value FROM settings WHERE key IN ("po_status_options","invoice_status_options")')}
 
 
@@ -246,12 +263,14 @@ def dashboard(request:Request):
     perms=set(user['permissions'].split(','))
     if not perms & {'pos_edit','invoice_edit','issue_edit','task_edit'}:
         data['pos']=data['lines']=data['reminders']=data['urgent']=[]
+        data['regional_rows']=data['assigned_invoice_numbers']=data['documents']=[]
     else:
         for p in data['pos']+data['lines']+data['reminders']+data['urgent']:p['value']=None
     if not perms & {'inventory_edit','invoice_edit'}:data['stock']=data['batches']=[]
     if 'invoice_edit' not in perms:data['invoices']=[]
     if 'issue_edit' not in perms:data['issues']=[]
     if 'task_edit' not in perms:data['tasks']=[]
+    else:data['tasks']=[task for task in data['tasks'] if task['assigned_to']==user['username']]
     return data
 
 
@@ -315,9 +334,16 @@ def add_invoice(v:Invoice):
         if po['archived']: missing('Paid PO is archived; reopen it before booking a new invoice')
         if not v.number.strip(): missing('Invoice reference required')
         prefix = 'M' if po['number'].startswith('300') else 'T'
-        if not __import__('re').fullmatch(prefix+r'\d{4,}',v.number.strip().upper()): missing(f'Invoice number must start with {prefix} followed by at least four digits')
-        existing_number=c.execute('SELECT i.id,p.number po_number FROM invoices i JOIN pos p ON p.id=i.po_id WHERE UPPER(i.number)=?',(v.number.strip().upper(),)).fetchone()
-        if existing_number: raise HTTPException(409,{'message':'Invoice number already booked','invoice_id':existing_number['id'],'po_number':existing_number['po_number']})
+        reference=v.number.strip().upper()
+        assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(v.po_id,)).fetchone()
+        if assigned and reference!=assigned['number']:missing('Use the invoice number already assigned to this PO')
+        if not __import__('re').fullmatch(prefix+r'\d{4,}',reference): missing(f'Invoice number must start with {prefix} followed by at least four digits')
+        reserved=c.execute('SELECT po_id FROM po_invoice_numbers WHERE number=?',(reference,)).fetchone()
+        if reserved and reserved['po_id']!=v.po_id:raise HTTPException(409,{'message':'Invoice number assigned to another PO'})
+        existing_number=c.execute('''SELECT i.id,i.po_id,p.number po_number FROM invoices i JOIN pos p ON p.id=i.po_id
+          WHERE UPPER(COALESCE(NULLIF(i.reference_number,''),i.number))=? ORDER BY i.id''',(reference,)).fetchone()
+        if existing_number and (existing_number['po_id']!=v.po_id or not po['number'].startswith('300')):
+            raise HTTPException(409,{'message':'Invoice number already booked','invoice_id':existing_number['id'],'po_number':existing_number['po_number']})
         po_lines=rows(c,'''SELECT l.id,l.po_id,l.item_code,l.quantity,l.due_date,
           COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
             WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
@@ -336,7 +362,13 @@ def add_invoice(v:Invoice):
             if row['reserved_line']+seen_lines[line.po_line_id]>remaining.get(line.po_line_id,0): missing('Invoice quantity exceeds outstanding PO line quantity')
             if row['reserved']+seen_batches[line.batch_id]>row['stock']: missing('Insufficient free batch stock')
         try:
-            iid=c.execute('INSERT INTO invoices(number,po_id,value,asn_number,asn_date,asn_link,asn_remarks) VALUES(?,?,?,?,?,?,?)',(v.number.strip().upper(),v.po_id,v.value,v.asn_number,v.asn_date,v.asn_link,v.asn_remarks)).lastrowid
+            internal=reference
+            if existing_number:
+                index=2
+                while c.execute('SELECT 1 FROM invoices WHERE number=?',(f'{reference}#{index}',)).fetchone():index+=1
+                internal=f'{reference}#{index}'
+            c.execute('INSERT INTO po_invoice_numbers(po_id,number) VALUES(?,?) ON CONFLICT(po_id) DO NOTHING',(v.po_id,reference))
+            iid=c.execute('INSERT INTO invoices(number,reference_number,po_id,value,asn_number,asn_date,asn_link,asn_remarks) VALUES(?,?,?,?,?,?,?,?)',(internal,reference,v.po_id,v.value,v.asn_number,v.asn_date,v.asn_link,v.asn_remarks)).lastrowid
             c.executemany('INSERT INTO invoice_lines(invoice_id,po_line_id,batch_id,quantity) VALUES(?,?,?,?)',[(iid,l.po_line_id,l.batch_id,l.quantity) for l in v.lines])
         except sqlite3.IntegrityError as e: missing(str(e))
     return {'id':iid,'status':'booked'}
@@ -412,7 +444,10 @@ def add_task(v:Task):
 async def task_status(task_id:int,request:Request):
     v=await request.json()
     if v.get('status') not in ('open','in_progress','done'): missing('Invalid status')
-    with db() as c: c.execute('UPDATE tasks SET status=? WHERE id=?',(v['status'],task_id))
+    with db() as c:
+        task=c.execute('SELECT task_type FROM tasks WHERE id=?',(task_id,)).fetchone()
+        if task and task['task_type']=='asn_booking':missing('Use the ASN submission and review workflow')
+        c.execute('UPDATE tasks SET status=? WHERE id=?',(v['status'],task_id))
     return {'ok':True}
 
 

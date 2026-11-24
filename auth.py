@@ -44,12 +44,15 @@ def verify(password, stored):
 def capability(path,method):
     if path=='/api/dashboard':return ''
     if path.startswith('/api/auth/users'): return 'users_manage'
+    if path.startswith('/api/admin/'): return 'users_manage'
     if path.startswith(('/api/import/','/api/nupco/')):
         return 'imports_apply' if method=='POST' else 'reports_view'
     if path.startswith('/api/seed/'): return 'imports_apply'
     if path.startswith('/api/inventory/starting-'): return 'inventory_edit'
     if path.startswith('/api/status-options'): return 'users_manage' if method!='GET' else ''
     if path.startswith('/api/po-pdf/'): return 'pos_edit'
+    if path.startswith('/api/po-documents/'): return 'imports_apply'
+    if path.startswith('/api/asn-assignments'): return 'task_edit'
     if path.startswith('/api/documents/'): return 'pos_edit'
     if path.startswith('/api/reports/operations'): return 'reports_view'
     if path.startswith('/api/items') or path.startswith('/api/batches'): return 'inventory_edit'
@@ -65,6 +68,8 @@ def capability(path,method):
 @app.middleware('http')
 async def protect(request:Request,call_next):
     path=request.url.path
+    if getattr(app.state,'maintenance',False) and path.startswith('/api/'):
+        return JSONResponse({'detail':'Database maintenance in progress; retry shortly'},status_code=503)
     if path=='/' or path in ('/api/auth/login','/api/auth/logout','/api/auth/reset-request','/api/auth/reset-confirm'):
         return await call_next(request)
     if not path.startswith('/api/') and path not in ('/docs','/openapi.json','/redoc'):

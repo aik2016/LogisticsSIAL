@@ -46,9 +46,15 @@ def capability(path,method):
     if path.startswith('/api/auth/users'): return 'users_manage'
     if path.startswith(('/api/import/','/api/nupco/')):
         return 'imports_apply' if method=='POST' else 'reports_view'
+    if path.startswith('/api/seed/'): return 'imports_apply'
+    if path.startswith('/api/inventory/starting-'): return 'inventory_edit'
+    if path.startswith('/api/status-options'): return 'users_manage' if method!='GET' else ''
     if path.startswith('/api/po-pdf/'): return 'pos_edit'
+    if path.startswith('/api/documents/'): return 'pos_edit'
+    if path.startswith('/api/reports/operations'): return 'reports_view'
     if path.startswith('/api/items') or path.startswith('/api/batches'): return 'inventory_edit'
     if path.startswith('/api/pos'): return 'pos_edit' if method!='GET' else 'reports_view'
+    if path=='/api/invoices/next-number': return 'invoice_edit'
     if path.startswith('/api/invoices'): return 'invoice_edit' if method!='GET' else 'reports_view'
     if path.startswith('/api/issues'): return 'issue_edit'
     if path.startswith('/api/tasks'): return 'task_edit'
@@ -113,6 +119,7 @@ class UserCreate(BaseModel):
     password:str
     permissions:list[str]=[]
     email:str=''
+    is_admin:bool=False
 
 
 @app.get('/api/auth/users')
@@ -126,7 +133,9 @@ def create_user(v:UserCreate,request:Request):
     try: password_hash=hash_password(v.password)
     except ValueError as e:raise HTTPException(400,str(e))
     with db() as c:
-        try: uid=c.execute('INSERT INTO users(username,email,password_hash,permissions) VALUES(?,?,?,?)',(v.username.strip(),v.email.strip().lower(),password_hash,','.join(sorted(set(v.permissions))))).lastrowid
+        owner=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1').fetchone()
+        if v.is_admin and (not request.state.user['is_admin'] or not owner or request.state.user['id']!=owner['id']):raise HTTPException(403,'Only the primary admin can create assistant admins')
+        try: uid=c.execute('INSERT INTO users(username,email,password_hash,is_admin,permissions) VALUES(?,?,?,?,?)',(v.username.strip(),v.email.strip().lower(),password_hash,int(v.is_admin),','.join(sorted(set(v.permissions))))).lastrowid
         except sqlite3.IntegrityError:raise HTTPException(409,'Username already exists')
         c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'create_user',str(uid)))
     return {'id':uid}
@@ -146,6 +155,8 @@ def update_user(user_id:int,v:UserUpdate,request:Request):
     with db() as c:
         target=c.execute('SELECT * FROM users WHERE id=?',(user_id,)).fetchone()
         if not target:raise HTTPException(404,'User not found')
+        owner=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1').fetchone()
+        if owner and user_id==owner['id'] and request.state.user['id']!=owner['id']:raise HTTPException(403,'Primary admin account is protected')
         if target['is_admin'] and not request.state.user['is_admin']:raise HTTPException(403,'Only an admin can change an admin account')
         if target['is_admin'] and (v.active is False or v.permissions is not None):raise HTTPException(400,'Admin account cannot be deactivated or restricted here')
         if v.active is not None:

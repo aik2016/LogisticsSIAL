@@ -2,3 +2,8 @@
 __pycache__/
 .venv/
 .env
+documents/
+attachments/
+*.xlsx
+*.pdf
+*.PDF

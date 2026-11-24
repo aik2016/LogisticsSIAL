@@ -73,3 +73,17 @@ Usually the process is not listening on Railway's `$PORT`.
 Do not expose this prototype to the internet or enter real business data yet. SMTP configuration for email resets, login rate limiting, full audit coverage, secure document storage and extraction, Nupco report reconciliation, Odoo import mapping, scheduled notifications, database migrations/backups, tenant isolation, HTTPS hosting and security review remain. The reminders appear on the dashboard only. Invoice reference rules must be finalized from actual Odoo samples. Nupco workbooks can be stored as evidence, but detailed matching and automatic status proposals are still being built. PDF details are extracted for review but cannot yet be applied directly as a new PO; scanned PDFs need OCR.
 
 GitHub can hold this source, but GitHub Pages cannot run the Python backend. Deploy to a Python-capable host with persistent database storage after the production work above.
+
+## Updated operational workflow (November 2026)
+
+The admin interface now has Control Center, Reports, Open POs, Inventory, Imports & PO PDFs, Tasks, and Admin Control. The Imports screen accepts the supplied PO Masterlist, Due and Region, and formatted Sial PO Report workbooks. Preview and approve each file in that order. Imports are fingerprinted to prevent duplicate application; existing PO lines with different quantities or due dates are blocked for review. Uploaded business workbooks and PDF documents are **not committed to GitHub**. PO PDFs are stored on the Railway `/data` volume and can be downloaded from the PO record. Back up that volume regularly.
+
+For bulk PO entry, choose several PDFs, review the extracted PO number, value, customer PO, item lines, quantities, dates and addresses, then approve. Invoices must use the next available M or T number displayed on the PO. The app tracks Odoo invoices; it does not issue them. Booking reserves batch stock, and delivery deducts it. The delivery and GR status buttons require confirmation. A GR PDF is required when setting the PO's GR issued status.
+
+The Inventory screen accepts an XLSX sheet with columns `Item Code`, `Batch No`, `Quantity`, `Manufacturing Date`, and `Expiry Date`. Preview before applying it. It sets a starting quantity only for batches without movement history, and applying the same workbook twice does not duplicate stock. Physical returns are entered against an invoice and batch.
+
+The outstanding item report starts from the Sial workbook's remaining quantities and assigns multi-due balances to the latest due lines first. Review partly delivered POs where a different due-line allocation is required.
+
+The 21 November 2026 supplied Sial report has 109 outstanding POs, while the regional sheets identify 107. Four outstanding PO numbers are not in the regional sheets: `3001286938`, `3001339159`, `4300009793`, and `4600123443`. Two region-sheet PO numbers are not listed in the Sial Outstanding sheet: `3001218742` and `3001402019`. The app leaves missing regions unassigned; verify these records before relying on region totals.
+
+The app is still a single-company operational prototype. Before selling it to other companies, add company isolation, automated backups, a production database migration process, and a security review.

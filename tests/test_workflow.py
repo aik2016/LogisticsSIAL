@@ -39,7 +39,7 @@ class WorkflowTest(unittest.TestCase):
         b=self.call('batches',{'item_code':'CTND-200','batch_no':'B1','quantity':1000})['id']
         p=self.call('pos',{'number':'4300007810','kind':'tender'})['id']
         line=self.call(f'pos/{p}/lines',{'line_no':'0010','item_code':'CTND-200','quantity':800,'due_date':'2027-01-01'})['id']
-        inv=self.call('invoices',{'number':'N001','po_id':p,'lines':[{'po_line_id':line,'batch_id':b,'quantity':500}]})['id']
+        inv=self.call('invoices',{'number':'T0001','po_id':p,'lines':[{'po_line_id':line,'batch_id':b,'quantity':500}]})['id']
         stock=self.client.get('/api/dashboard').json()['stock'][0]
         self.assertEqual((stock['physical'],stock['booked'],stock['free']),(1000,500,500))
         for status in ('dispatched','delivered','gr_issued'):
@@ -68,6 +68,34 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(lines['n'],2)
             packs={r['code']:r['boxes_per_pallet'] for r in c.execute("SELECT code,boxes_per_pallet FROM items WHERE code IN ('RIM-70','RIMZP-45','RIMZP-50')")}
             self.assertEqual(packs,{'RIM-70':9,'RIMZP-45':14,'RIMZP-50':14})
+
+    def test_operational_status_and_primary_admin_protection(self):
+        p=self.call('pos',{'number':'3001888888','kind':'marketplace'})['id']
+        r=self.client.post(f'/api/pos/{p}/operational-status',data={'status':'gr_issued','confirmed':'true'},headers=self.headers)
+        self.assertEqual(r.status_code,400)
+        r=self.client.post(f'/api/pos/{p}/operational-status',data={'status':'asn_booked','confirmed':'true','asn_number':'ASN-42','asn_date':'2026-11-24'},headers=self.headers)
+        self.assertEqual(r.status_code,200,r.text)
+        r=self.client.patch(f'/api/pos/{p}/marketplace-stage',json={'status':'rcv_returned','confirmed':True},headers=self.headers)
+        self.assertEqual(r.status_code,400)
+        r=self.client.patch(f'/api/pos/{p}/marketplace-stage',json={'status':'rcv_returned','reason':'Wrong delivery address','confirmed':True},headers=self.headers)
+        self.assertEqual(r.status_code,200,r.text)
+        helper=self.call('auth/users',{'username':'helper','password':'temporary helper password','is_admin':True})['id']
+        other=TestClient(app)
+        self.assertEqual(other.post('/api/auth/login',json={'username':'helper','password':'temporary helper password'}).status_code,200)
+        r=other.patch('/api/auth/users/1',json={'password':'cannot change owner password'},headers=self.headers)
+        self.assertEqual(r.status_code,403)
+        self.assertNotEqual(helper,1)
+
+    def test_starting_stock_import_is_idempotent(self):
+        content=workbook({'Stock':[['Item Code','Batch No','Quantity','Manufacturing Date','Expiry Date'],['RIB-35','LOT-1',600,'01.01.2026','01.01.2029']]})
+        r=self.client.post('/api/inventory/starting-preview',files={'file':('stock.xlsx',content)},headers=self.headers)
+        self.assertEqual((r.status_code,r.json()['rows'],r.json()['error_count']),(200,1,0))
+        fingerprint=r.json()['fingerprint']
+        for expected in (False,True):
+            r=self.client.post('/api/inventory/starting-apply',data={'fingerprint':fingerprint},files={'file':('stock.xlsx',content)},headers=self.headers)
+            self.assertEqual(r.status_code,200,r.text)
+            self.assertEqual(r.json()['already_imported'],expected)
+        with db() as c:self.assertEqual(c.execute("SELECT quantity FROM batches WHERE batch_no='LOT-1'").fetchone()[0],600)
 
 
 if __name__=='__main__':unittest.main()

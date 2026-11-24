@@ -11,11 +11,13 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).parent
 DB = Path(os.getenv('LOGISTICS_DB', ROOT / 'logistics.db'))
 app = FastAPI(title='Logistics Control')
+app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 SAUDI_TZ = ZoneInfo('Asia/Riyadh')
 
 
@@ -50,9 +52,16 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS source_rows (id INTEGER PRIMARY KEY, source_name TEXT NOT NULL, sheet TEXT NOT NULL, row_number INTEGER NOT NULL, row_json TEXT NOT NULL, imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(source_name,sheet,row_number));
         CREATE TABLE IF NOT EXISTS source_status (id INTEGER PRIMARY KEY, source_name TEXT NOT NULL, po_number TEXT NOT NULL, value REAL, status TEXT DEFAULT '', invoice_reference TEXT DEFAULT '', invoice_status TEXT DEFAULT '', remaining_detail TEXT DEFAULT '', remarks TEXT DEFAULT '', observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(source_name,po_number));
+        CREATE TABLE IF NOT EXISTS po_documents (id INTEGER PRIMARY KEY, po_id INTEGER NOT NULL REFERENCES pos(id), filename TEXT NOT NULL, stored_name TEXT NOT NULL UNIQUE, uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS po_status_events (id INTEGER PRIMARY KEY, po_id INTEGER NOT NULL REFERENCES pos(id), status TEXT NOT NULL, reason TEXT DEFAULT '', user_id INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS invoice_number_transfers (id INTEGER PRIMARY KEY, number TEXT NOT NULL, from_po_id INTEGER NOT NULL, to_po_id INTEGER NOT NULL, user_id INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS po_remaining_snapshot (po_id INTEGER NOT NULL REFERENCES pos(id), item_code TEXT NOT NULL, remaining_qty INTEGER NOT NULL CHECK(remaining_qty>=0), source_name TEXT NOT NULL, PRIMARY KEY(po_id,item_code));
         ''')
         if 'address' not in [r['name'] for r in c.execute('PRAGMA table_info(po_lines)')]:
             c.execute("ALTER TABLE po_lines ADD COLUMN address TEXT DEFAULT ''")
+        for column,definition in [('invoice_status',"TEXT DEFAULT 'rcv_needed'"),('marketplace_status',"TEXT DEFAULT ''"),('marketplace_reason',"TEXT DEFAULT ''"),('archived',"INTEGER DEFAULT 0"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''")]:
+            if column not in [r['name'] for r in c.execute('PRAGMA table_info(pos)')]:
+                c.execute(f'ALTER TABLE pos ADD COLUMN {column} {definition}')
         # Apply family defaults only to items whose pallet size is still unknown.
         c.execute("UPDATE items SET boxes_per_pallet=14 WHERE boxes_per_pallet=0 AND code LIKE 'RIMZP-%'")
         c.execute("UPDATE items SET boxes_per_pallet=9 WHERE boxes_per_pallet=0 AND (code LIKE 'RIM-%' OR code LIKE 'RIB-%')")
@@ -68,6 +77,24 @@ def rows(c, sql, args=()):
 
 def missing(message):
     raise HTTPException(400, message)
+
+
+def outstanding_by_line(c, lines):
+    """Allocate report balances to the latest due lines, then account for new deliveries."""
+    snapshots={(r['po_id'],r['item_code']):r['remaining_qty'] for r in rows(c,'SELECT po_id,item_code,remaining_qty FROM po_remaining_snapshot')}
+    grouped={}
+    for line in lines:grouped.setdefault((line['po_id'],line['item_code']),[]).append(line)
+    result={}
+    for key,group in grouped.items():
+        if key in snapshots:
+            remaining=snapshots[key]
+            for line in sorted(group,key=lambda x:(x['due_date'],x['id']),reverse=True):
+                base=min(line['quantity'],remaining)
+                remaining-=base
+                result[line['id']]=max(0,base-(line.get('delivered_qty') or 0))
+        else:
+            for line in group:result[line['id']]=max(0,line['quantity']-(line.get('delivered_qty') or 0))
+    return result
 
 
 class Item(BaseModel):
@@ -162,39 +189,53 @@ def dashboard_data():
         pos = rows(c, '''SELECT p.*, MIN(l.due_date) due_date, SUM(l.quantity) ordered_qty,
           (SELECT ss.status FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_status,
           (SELECT ss.invoice_status FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_invoice_status,
+          (SELECT ss.remaining_detail FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_remaining,
           COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE i.po_id=p.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
           FROM pos p LEFT JOIN po_lines l ON l.po_id=p.id GROUP BY p.id ORDER BY due_date''')
         for p in pos:
             due = date.fromisoformat(p['due_date']) if p['due_date'] else None
             p['days_to_due'] = (due-today).days if due else None
-            source_done = (p['source_status'] or '').lower().startswith('delivered')
+            source_done = (p['source_status'] or '').lower().startswith('delivered') and str(p['source_remaining'] or '').strip() in ('0','0.0','0.00')
+            if source_done and not p['delivered_qty']: p['delivered_qty'] = p['ordered_qty']
             outstanding = not source_done and ((p['delivered_qty'] or 0) < (p['ordered_qty'] or 0))
             p['urgent'] = bool(due and due < today and outstanding)
-            p['reminder'] = p['days_to_due'] in (10, 5, 2, 0) and outstanding
+            p['reminder'] = p['days_to_due'] is not None and 0 <= p['days_to_due'] <= 14 and outstanding
         stock = rows(c, '''SELECT i.code,i.description,i.pcs_per_box,i.boxes_per_pallet,COALESCE(SUM(b.quantity),0) physical,
           COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices v ON v.id=il.invoice_id JOIN batches bx ON bx.id=il.batch_id WHERE bx.item_code=i.code AND v.status IN ('booked','dispatched')),0) booked
           FROM items i LEFT JOIN batches b ON b.item_code=i.code GROUP BY i.code ORDER BY i.code''')
         for s in stock: s['free'] = s['physical'] - s['booked']
-        invoices = rows(c, 'SELECT i.*,p.number po_number FROM invoices i JOIN pos p ON p.id=i.po_id ORDER BY i.id DESC')
+        invoices = rows(c, '''SELECT i.*,p.number po_number,
+          COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il WHERE il.invoice_id=i.id),0) quantity
+          FROM invoices i JOIN pos p ON p.id=i.po_id ORDER BY i.id DESC''')
         due_lines = rows(c, '''SELECT p.id po_id,p.number,p.customer,p.customer_po,p.region,p.value,p.status,p.overdue_reason,
-           l.line_no,l.item_code,l.quantity ordered_qty,l.due_date,
+           l.id,l.line_no,l.item_code,l.quantity,l.quantity ordered_qty,l.due_date,
            COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
            FROM po_lines l JOIN pos p ON p.id=l.po_id''')
+        remaining=outstanding_by_line(c,due_lines)
         status_by_id = {p['id']:p for p in pos}
         reminders=[];urgent=[]
+        po_remaining={}
         for line in due_lines:
             parent=status_by_id[line['po_id']]
-            if (parent['source_status'] or '').lower().startswith('delivered'): continue
-            if line['delivered_qty'] >= line['ordered_qty']: continue
+            line['outstanding_qty']=remaining[line['id']]
+            po_remaining[line['po_id']]=po_remaining.get(line['po_id'],0)+line['outstanding_qty']
+            if not line['outstanding_qty']: continue
             line['days_to_due']=(date.fromisoformat(line['due_date'])-today).days
             line['source_status']=parent['source_status']
             line['urgent']=line['days_to_due']<0
             if line['urgent']:urgent.append(line)
-            if line['days_to_due'] in (10,5,2,0):reminders.append(line)
+            if 0 <= line['days_to_due'] <= 14:reminders.append(line)
+        for p in pos:
+            if c.execute('SELECT 1 FROM po_remaining_snapshot WHERE po_id=? LIMIT 1',(p['id'],)).fetchone():
+                p['delivered_qty']=max(0,(p['ordered_qty'] or 0)-po_remaining.get(p['id'],0))
+            p['urgent']=any(x['po_id']==p['id'] for x in urgent)
+            p['reminder']=any(x['po_id']==p['id'] for x in reminders)
         return {'pos':pos,'stock':stock,'batches':rows(c,'SELECT * FROM batches ORDER BY id DESC'), 'invoices':invoices,
                 'issues':rows(c,'SELECT * FROM issues ORDER BY id DESC'), 'tasks':rows(c,'SELECT * FROM tasks ORDER BY id DESC'),
                 'lines':rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date'),
-                'reminders':reminders, 'urgent':urgent}
+                'reminders':reminders, 'urgent':urgent,
+                'documents':rows(c,'SELECT d.id,d.po_id,d.filename,d.uploaded_at FROM po_documents d ORDER BY d.id DESC'),
+                'status_options':rows(c,'SELECT key,value FROM settings WHERE key IN ("po_status_options","invoice_status_options")')}
 
 
 @app.get('/api/dashboard')
@@ -269,23 +310,33 @@ async def update_po(po_id:int,request:Request):
 def add_invoice(v:Invoice):
     if not v.lines: missing('Invoice needs at least one line')
     with db() as c:
-        po=c.execute('SELECT number FROM pos WHERE id=?',(v.po_id,)).fetchone()
+        po=c.execute('SELECT number,archived,status FROM pos WHERE id=?',(v.po_id,)).fetchone()
         if not po: missing('PO not found')
+        if po['archived']: missing('Paid PO is archived; reopen it before booking a new invoice')
         if not v.number.strip(): missing('Invoice reference required')
+        prefix = 'M' if po['number'].startswith('300') else 'T'
+        if not __import__('re').fullmatch(prefix+r'\d{4,}',v.number.strip().upper()): missing(f'Invoice number must start with {prefix} followed by at least four digits')
+        existing_number=c.execute('SELECT i.id,p.number po_number FROM invoices i JOIN pos p ON p.id=i.po_id WHERE UPPER(i.number)=?',(v.number.strip().upper(),)).fetchone()
+        if existing_number: raise HTTPException(409,{'message':'Invoice number already booked','invoice_id':existing_number['id'],'po_number':existing_number['po_number']})
+        po_lines=rows(c,'''SELECT l.id,l.po_id,l.item_code,l.quantity,l.due_date,
+          COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
+            WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
+          FROM po_lines l WHERE l.po_id=?''',(v.po_id,))
+        remaining=outstanding_by_line(c,po_lines)
         seen_lines = {}
         seen_batches = {}
         for line in v.lines:
             row=c.execute('''SELECT l.quantity,l.item_code,b.item_code batch_item,b.quantity stock,
-              COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.po_line_id=l.id AND i.status!='cancelled'),0) allocated,
+              COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.po_line_id=l.id AND i.status IN ('booked','dispatched')),0) reserved_line,
               COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.batch_id=b.id AND i.status IN ('booked','dispatched')),0) reserved
               FROM po_lines l JOIN batches b ON b.id=? WHERE l.id=? AND l.po_id=?''',(line.batch_id,line.po_line_id,v.po_id)).fetchone()
             if not row or row['item_code']!=row['batch_item']: missing('Line and batch must belong to the same item and PO')
             seen_lines[line.po_line_id] = seen_lines.get(line.po_line_id, 0) + line.quantity
             seen_batches[line.batch_id] = seen_batches.get(line.batch_id, 0) + line.quantity
-            if row['allocated']+seen_lines[line.po_line_id]>row['quantity']: missing('Invoice quantity exceeds PO line quantity')
+            if row['reserved_line']+seen_lines[line.po_line_id]>remaining.get(line.po_line_id,0): missing('Invoice quantity exceeds outstanding PO line quantity')
             if row['reserved']+seen_batches[line.batch_id]>row['stock']: missing('Insufficient free batch stock')
         try:
-            iid=c.execute('INSERT INTO invoices(number,po_id,value,asn_number,asn_date,asn_link,asn_remarks) VALUES(?,?,?,?,?,?,?)',(v.number,v.po_id,v.value,v.asn_number,v.asn_date,v.asn_link,v.asn_remarks)).lastrowid
+            iid=c.execute('INSERT INTO invoices(number,po_id,value,asn_number,asn_date,asn_link,asn_remarks) VALUES(?,?,?,?,?,?,?)',(v.number.strip().upper(),v.po_id,v.value,v.asn_number,v.asn_date,v.asn_link,v.asn_remarks)).lastrowid
             c.executemany('INSERT INTO invoice_lines(invoice_id,po_line_id,batch_id,quantity) VALUES(?,?,?,?)',[(iid,l.po_line_id,l.batch_id,l.quantity) for l in v.lines])
         except sqlite3.IntegrityError as e: missing(str(e))
     return {'id':iid,'status':'booked'}
@@ -311,6 +362,24 @@ def invoice_status(invoice_id:int,v:Status):
         column={'dispatched':'dispatched_at','delivered':'delivered_at','gr_issued':'gr_at','uploaded':'uploaded_at'}.get(v.status)
         if column: c.execute(f'UPDATE invoices SET status=?,{column}=? WHERE id=?',(v.status,v.when or business_today().isoformat(),invoice_id))
         else: c.execute('UPDATE invoices SET status=? WHERE id=?',(v.status,invoice_id))
+        po_id=inv['po_id']
+        if v.status in ('dispatched','delivered','gr_issued'):
+            totals=c.execute('''SELECT COALESCE(SUM(l.quantity),0) ordered,
+              COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
+                WHERE i.po_id=? AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered
+              FROM po_lines l WHERE l.po_id=?''',(po_id,po_id)).fetchone()
+            if v.status=='dispatched':
+                c.execute("UPDATE pos SET status='dispatched' WHERE id=? AND status IN ('open','asn_booked')",(po_id,))
+            elif totals['ordered'] and totals['delivered']>=totals['ordered']:
+                c.execute('UPDATE pos SET status=? WHERE id=?',(v.status,po_id))
+            else:
+                c.execute("UPDATE pos SET status='dispatched' WHERE id=? AND status IN ('open','asn_booked')",(po_id,))
+        if v.status=='uploaded':c.execute("UPDATE pos SET invoice_status='invoiced_up' WHERE id=?",(po_id,))
+        if v.status=='paid':
+            remaining=c.execute("SELECT COUNT(*) FROM invoices WHERE po_id=? AND status!='paid'",(po_id,)).fetchone()[0]
+            po=c.execute('SELECT status FROM pos WHERE id=?',(po_id,)).fetchone()
+            if remaining==0 and po['status'] in ('delivered','gr_issued'):
+                c.execute("UPDATE pos SET invoice_status='paid',archived=1 WHERE id=?",(po_id,))
     return {'ok':True}
 
 
@@ -368,3 +437,5 @@ import imports  # register workbook import routes
 import auth  # register account routes and access control
 
 import pdf_extract  # register review-only PDF extraction
+
+import updates  # register operational workflows

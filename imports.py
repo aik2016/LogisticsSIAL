@@ -58,7 +58,7 @@ def decode(content, kind):
                 try:
                     if not po or not re.fullmatch(r'\d{10}',po): raise ValueError('Missing or invalid PO number')
                     if sheet=='Marketplace' and not po.startswith('300'): raise ValueError('Marketplace PO must start with 300')
-                    if sheet=='Tender' and not po.startswith(('4300','4600')): raise ValueError('Tender PO must start with 4300 or 4600')
+                    if sheet=='Tender' and not po.startswith(('300','4300','4600')): raise ValueError('PO must start with 300, 4300 or 4600')
                     code=str(r[1]).strip().upper()
                     if not re.fullmatch(r'[A-Z0-9]+(?:-[A-Z0-9]+)+',code): raise ValueError('Invalid item code')
                     result.append(dict(sheet=sheet,row=n,po=po,item=code,quantity=qty(r[2]),due_date=due(r[3]),address=str(r[4] or '').strip(),value=money(r[5]),continued=not bool(raw)))

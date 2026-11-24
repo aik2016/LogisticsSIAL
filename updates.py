@@ -298,7 +298,11 @@ def operations_report(region:str='',include_archived:bool=False):
                 by_item[line['item_code']]+=quantity
                 by_region_item[(line['region'] or 'Unassigned',line['item_code'])]+=quantity
             if line['status']=='asn_booked' and quantity:
-                line['batches']=rows(c,'SELECT batch_no,quantity FROM batches WHERE item_code=? AND quantity>0 ORDER BY expiry_date',(line['item_code'],))
+                assigned=rows(c,'''SELECT b.batch_no,SUM(il.quantity) quantity FROM invoice_lines il
+                  JOIN invoices v ON v.id=il.invoice_id JOIN batches b ON b.id=il.batch_id
+                  WHERE v.po_id=? AND b.item_code=? AND v.status IN ('booked','dispatched') GROUP BY b.id''',(line['po_id'],line['item_code']))
+                line['batches']=[{**b,'source':'booked'} for b in assigned] if assigned else [
+                    {**b,'source':'available'} for b in rows(c,'SELECT batch_no,quantity FROM batches WHERE item_code=? AND quantity>0 ORDER BY expiry_date',(line['item_code'],))]
                 pick.append(line)
         return {'by_item':[{'item_code':k,'quantity':v} for k,v in sorted(by_item.items())],
                 'by_region_item':[{'region':r,'item_code':i,'quantity':v} for (r,i),v in sorted(by_region_item.items())],

@@ -54,7 +54,8 @@ def capability(path,method):
     if path.startswith('/api/po-documents/'): return 'imports_apply'
     # Assignment ownership, rather than a broad tool grant, controls ASN submissions.
     if path.startswith('/api/asn-assignments'): return ''
-    if path.startswith('/api/documents/'): return 'pos_edit'
+    if path.startswith('/api/warehouse-assignments'): return ''
+    if path.startswith('/api/documents/'): return ''
     if path.startswith('/api/reports/operations'): return 'reports_view'
     if path.startswith('/api/items') or path.startswith('/api/batches'): return 'inventory_edit'
     if path.startswith('/api/pos/') and path.endswith('/invoice-stage'): return 'invoice_edit'

@@ -69,6 +69,8 @@ def init_db():
             c.execute("UPDATE invoices SET reference_number=number WHERE reference_number='' OR reference_number IS NULL")
         if 'sha256' not in [r['name'] for r in c.execute('PRAGMA table_info(po_documents)')]:
             c.execute("ALTER TABLE po_documents ADD COLUMN sha256 TEXT DEFAULT ''")
+        if 'document_type' not in [r['name'] for r in c.execute('PRAGMA table_info(po_documents)')]:
+            c.execute("ALTER TABLE po_documents ADD COLUMN document_type TEXT DEFAULT 'PO'")
         for column,definition in [('created_by','INTEGER'),('task_type',"TEXT DEFAULT ''"),('invoice_number',"TEXT DEFAULT ''"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''"),('asn_remarks',"TEXT DEFAULT ''"),('submitted_at','TEXT'),('reviewed_at','TEXT')]:
             if column not in [r['name'] for r in c.execute('PRAGMA table_info(tasks)')]:
                 c.execute(f'ALTER TABLE tasks ADD COLUMN {column} {definition}')
@@ -222,6 +224,8 @@ def dashboard_data():
           FROM invoices i JOIN pos p ON p.id=i.po_id ORDER BY i.id DESC''')
         region_rows=rows(c,'''SELECT r.* FROM regional_po_rows r WHERE r.source_name=
           (SELECT source_name FROM regional_po_rows ORDER BY id DESC LIMIT 1) ORDER BY po_number,row_number''')
+        regional_pos={r['po_number'] for r in region_rows}
+        for p in pos:p['is_outstanding']=p['number'] in regional_pos if region_rows else False
         due_lines = rows(c, '''SELECT p.id po_id,p.number,p.customer,p.customer_po,p.region,p.value,p.status,p.overdue_reason,
            l.id,l.line_no,l.item_code,l.quantity,l.quantity ordered_qty,l.due_date,
            COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
@@ -245,11 +249,32 @@ def dashboard_data():
                 p['delivered_qty']=max(0,(p['ordered_qty'] or 0)-po_remaining.get(p['id'],0))
             p['urgent']=any(x['po_id']==p['id'] for x in urgent)
             p['reminder']=any(x['po_id']==p['id'] for x in reminders)
+        if region_rows:
+            by_number={p['number']:p for p in pos}
+            reminders=[];urgent=[]
+            for regional in region_rows:
+                parent=by_number.get(regional['po_number'])
+                raw_date=str(regional['due_date'] or '')[:10]
+                try:days=(date.fromisoformat(raw_date)-today).days
+                except ValueError:continue
+                if not parent:continue
+                if not parent['due_date'] or raw_date<parent['due_date']:parent['due_date']=raw_date
+                quantity_text=str(regional['left_qty'] or regional['planned_qty'] or '0').replace(',','')
+                try:quantity=int(float(quantity_text))
+                except ValueError:quantity=0
+                item={'po_id':parent['id'],'number':parent['number'],'item_code':regional['item_text'],
+                      'ordered_qty':quantity,'delivered_qty':0,'region':regional['region'],
+                      'due_date':raw_date,'days_to_due':days,'source_status':regional['status']}
+                if days<0:urgent.append(item)
+                elif days<=14:reminders.append(item)
+            for p in pos:
+                p['urgent']=any(x['po_id']==p['id'] for x in urgent)
+                p['reminder']=any(x['po_id']==p['id'] for x in reminders)
         return {'pos':pos,'stock':stock,'batches':rows(c,'SELECT * FROM batches ORDER BY id DESC'), 'invoices':invoices,
                 'issues':rows(c,'SELECT * FROM issues ORDER BY id DESC'), 'tasks':rows(c,'SELECT * FROM tasks ORDER BY id DESC'),
                 'lines':rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date'),
                 'reminders':reminders, 'urgent':urgent,
-                'documents':rows(c,'SELECT d.id,d.po_id,d.filename,d.uploaded_at FROM po_documents d ORDER BY d.id DESC'),
+                'documents':rows(c,'SELECT d.id,d.po_id,d.filename,d.document_type,d.uploaded_at FROM po_documents d ORDER BY d.id DESC'),
                 'regional_rows':region_rows,
                 'assigned_invoice_numbers':rows(c,'SELECT n.po_id,n.number FROM po_invoice_numbers n'),
                 'status_options':rows(c,'SELECT key,value FROM settings WHERE key IN ("po_status_options","invoice_status_options")')}
@@ -262,8 +287,16 @@ def dashboard(request:Request):
     if user['is_admin'] or 'reports_view' in user['permissions'].split(','): return data
     perms=set(user['permissions'].split(','))
     if not perms & {'pos_edit','invoice_edit','issue_edit','task_edit'}:
-        data['pos']=data['lines']=data['reminders']=data['urgent']=[]
-        data['regional_rows']=data['assigned_invoice_numbers']=data['documents']=[]
+        assigned={t['po_id'] for t in data['tasks'] if t['assigned_to']==user['username'] and t['po_id'] is not None}
+        data['pos']=[p for p in data['pos'] if p['id'] in assigned]
+        numbers={p['number'] for p in data['pos']}
+        data['lines']=[x for x in data['lines'] if x['po_number'] in numbers]
+        data['reminders']=[x for x in data['reminders'] if x['po_id'] in assigned]
+        data['urgent']=[x for x in data['urgent'] if x['po_id'] in assigned]
+        data['regional_rows']=[x for x in data['regional_rows'] if x['po_number'] in numbers]
+        data['assigned_invoice_numbers']=[x for x in data['assigned_invoice_numbers'] if x['po_id'] in assigned]
+        data['documents']=[x for x in data['documents'] if x['po_id'] in assigned]
+        for p in data['pos']:p['value']=None
     else:
         for p in data['pos']+data['lines']+data['reminders']+data['urgent']:p['value']=None
     if not perms & {'inventory_edit','invoice_edit'}:data['stock']=data['batches']=[]
@@ -337,7 +370,8 @@ def add_invoice(v:Invoice):
         reference=v.number.strip().upper()
         assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(v.po_id,)).fetchone()
         if assigned and reference!=assigned['number']:missing('Use the invoice number already assigned to this PO')
-        if not __import__('re').fullmatch(prefix+r'\d{4,}',reference): missing(f'Invoice number must start with {prefix} followed by at least four digits')
+        legacy=bool(__import__('re').fullmatch(r'(?:0\d{2,}|N\d{2,})',reference))
+        if not legacy and not __import__('re').fullmatch(prefix+r'\d{4,}',reference): missing(f'Invoice number must start with {prefix}, 000, or N00')
         reserved=c.execute('SELECT po_id FROM po_invoice_numbers WHERE number=?',(reference,)).fetchone()
         if reserved and reserved['po_id']!=v.po_id:raise HTTPException(409,{'message':'Invoice number assigned to another PO'})
         existing_number=c.execute('''SELECT i.id,i.po_id,p.number po_number FROM invoices i JOIN pos p ON p.id=i.po_id

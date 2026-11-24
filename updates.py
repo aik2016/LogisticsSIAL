@@ -27,7 +27,7 @@ BACKUPS = DB.parent / 'backups'
 BACKUPS.mkdir(parents=True, exist_ok=True)
 BACKUP_LOCK = threading.Lock()
 MAX_FILE = 15_000_000
-CORE_PO = ['open', 'asn_booked', 'dispatched', 'delivered', 'gr_issued', 'asn_cancelled', 'asn_rejected']
+CORE_PO = ['open', 'asn_booked', 'dispatched', 'dispatch_cancelled', 'delivered', 'gr_issued', 'asn_cancelled', 'asn_rejected']
 CORE_INVOICE = ['rcv_needed', 'rcv_uploaded', 'ready_to_upload', 'invoiced_up', 'paid', 'partially_paid']
 
 
@@ -51,7 +51,9 @@ def create_backup(label):
 
 def primary_admin(request):
     if not request.state.user['is_admin']:fail('Primary admin only',403)
-    with db() as c:owner=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1').fetchone()
+    with db() as c:
+        owner=c.execute("SELECT id FROM users WHERE username='admin' AND is_admin=1").fetchone()
+        if not owner:owner=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1').fetchone()
     if not owner or owner['id']!=request.state.user['id']:fail('Primary admin only',403)
 
 
@@ -156,17 +158,67 @@ def stored_file(c, po_id, filename, content):
 @app.get('/api/pos/{po_id}/documents')
 def list_documents(po_id: int):
     with db() as c:
-        return rows(c, 'SELECT id,po_id,filename,uploaded_at FROM po_documents WHERE po_id=? ORDER BY id DESC', (po_id,))
+        return rows(c, 'SELECT id,po_id,filename,document_type,uploaded_at FROM po_documents WHERE po_id=? ORDER BY id DESC', (po_id,))
 
 
 @app.get('/api/documents/{document_id}')
-def download_document(document_id: int):
+def document_access(c,document_id,request):
+    row=c.execute('SELECT d.filename,d.stored_name,d.po_id FROM po_documents d WHERE d.id=?',(document_id,)).fetchone()
+    if not row:fail('Document not found',404)
+    u=request.state.user
+    if not u['is_admin'] and 'pos_edit' not in u['permissions'].split(','):
+        linked=c.execute('SELECT 1 FROM tasks WHERE po_id=? AND assigned_to=? LIMIT 1',(row['po_id'],u['username'])).fetchone()
+        if not linked:fail('Document access denied',403)
+    return row
+
+
+def download_document(document_id: int,request:Request):
     with db() as c:
-        row = c.execute('SELECT filename,stored_name FROM po_documents WHERE id=?', (document_id,)).fetchone()
-    if not row: fail('Document not found', 404)
+        row = document_access(c,document_id,request)
     path = DOCS / row['stored_name']
     if not path.is_file(): fail('Stored document is missing', 404)
-    return FileResponse(path, media_type='application/pdf', filename=row['filename'])
+    return FileResponse(path, filename=row['filename'])
+
+
+@app.get('/api/documents/{document_id}/view')
+def view_document(document_id:int,request:Request):
+    with db() as c:row=document_access(c,document_id,request)
+    path=DOCS / row['stored_name']
+    if not path.is_file():fail('Stored document is missing',404)
+    import mimetypes
+    media=mimetypes.guess_type(row['filename'])[0] or 'application/octet-stream'
+    if media not in ('application/pdf','image/png','image/jpeg','image/webp','text/plain'):
+        return FileResponse(path,filename=row['filename'])
+    return FileResponse(path,media_type=media,headers={'Content-Disposition':'inline'})
+
+
+@app.post('/api/pos/{po_id}/documents/upload')
+async def upload_related_document(po_id:int,document_type:str=Form(...),file:UploadFile=File(...)):
+    allowed={'PO','MRR','RCV','Rejection Form','GR','ASN','Invoice','Other'}
+    if document_type not in allowed:fail('Choose a document type')
+    content=await file.read()
+    if not content or len(content)>MAX_FILE:fail('File must be 1 byte to 15 MB')
+    suffix=Path(file.filename or '').suffix.lower()
+    if suffix not in ('.pdf','.png','.jpg','.jpeg','.webp','.txt','.docx','.xlsx'):
+        fail('Unsupported document format')
+    if suffix=='.pdf' and not content.startswith(b'%PDF-'):fail('Invalid PDF')
+    if suffix=='.png' and not content.startswith(b'\x89PNG\r\n\x1a\n'):fail('Invalid PNG')
+    if suffix in ('.jpg','.jpeg') and not content.startswith(b'\xff\xd8'):fail('Invalid JPEG')
+    if suffix in ('.docx','.xlsx') and not content.startswith(b'PK'):fail('Invalid Office file')
+    digest=hashlib.sha256(content).hexdigest()
+    with db() as c:
+        if not c.execute('SELECT 1 FROM pos WHERE id=?',(po_id,)).fetchone():fail('PO not found',404)
+        existing=c.execute('SELECT id FROM po_documents WHERE po_id=? AND sha256=?',(po_id,digest)).fetchone()
+        if existing:return {'id':existing['id'],'duplicate':True}
+        name=secrets.token_hex(16)+suffix
+        (DOCS / name).write_bytes(content)
+        try:
+            doc_id=c.execute('INSERT INTO po_documents(po_id,filename,stored_name,sha256,document_type) VALUES(?,?,?,?,?)',
+                 (po_id,Path(file.filename).name[:120],name,digest,document_type)).lastrowid
+        except Exception:
+            (DOCS / name).unlink(missing_ok=True)
+            raise
+    return {'id':doc_id,'duplicate':False}
 
 
 @app.post('/api/po-pdf/bulk-preview')
@@ -267,6 +319,10 @@ def next_invoice_number(po_id: int):
         if not po: fail('PO not found',404)
         assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po_id,)).fetchone()
         if assigned:return {'next_number':assigned['number'],'prefix':assigned['number'][0],'reused':True}
+        old=c.execute('SELECT invoice_reference FROM regional_po_rows WHERE po_number=? AND TRIM(invoice_reference)<>"" ORDER BY id DESC LIMIT 1',(po['number'],)).fetchone()
+        old_number=(old['invoice_reference'] or '').strip().upper() if old else ''
+        if re.fullmatch(r'(?:0\d{2,}|N\d{2,})',old_number):
+            return {'next_number':old_number,'prefix':old_number[0],'reused':True}
         prefix = 'M' if po['number'].startswith('300') else 'T'
         used={r['number'].upper() for r in rows(c,'SELECT number FROM po_invoice_numbers WHERE UPPER(number) LIKE ?', (prefix+'%',))}
         used.update(r['reference_number'].upper() for r in rows(c,'SELECT COALESCE(NULLIF(reference_number,\'\'),number) reference_number FROM invoices WHERE UPPER(COALESCE(NULLIF(reference_number,\'\'),number)) LIKE ?', (prefix+'%',)))
@@ -364,7 +420,7 @@ async def set_po_status(request:Request,po_id:int,status:str=Form(...),reason:st
         if po['status'] in ('delivered','gr_issued') and status=='open':
             if not request.state.user['is_admin']:fail('Only an admin can reopen a delivered PO',403)
             if not reason.strip():fail('A reason is required to reopen this PO')
-        if status=='asn_cancelled' and not reason.strip():fail('Enter the ASN cancellation reason')
+        if status in ('asn_cancelled','dispatch_cancelled') and not reason.strip():fail('Enter the cancellation reason')
         if content: stored_file(c,po_id,file.filename,content)
         c.execute('UPDATE pos SET status=?,asn_number=CASE WHEN ?="" THEN asn_number ELSE ? END,asn_date=CASE WHEN ?="" THEN asn_date ELSE ? END,asn_link=CASE WHEN ?="" THEN asn_link ELSE ? END,notes=CASE WHEN ?="" THEN notes ELSE COALESCE(notes,"") || CHAR(10) || ? END WHERE id=?',(status,asn_number,asn_number,asn_date,asn_date,asn_link,asn_link,reason,reason,po_id))
         c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(po_id,status,reason,request.state.user['id']))
@@ -611,6 +667,10 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
                 region=next(iter(regions))
                 c.execute('INSERT INTO pos(number,kind,region) VALUES(?,?,?) ON CONFLICT(number) DO NOTHING',(number,'marketplace' if number.startswith('300') else 'tender',region))
                 c.execute('UPDATE pos SET region=? WHERE number=?',(region,number))
+                if not c.execute('SELECT 1 FROM po_status_events e JOIN pos p ON p.id=e.po_id WHERE p.number=? LIMIT 1',(number,)).fetchone():
+                    raw=next((str(r['status']).lower() for r in records if r['po']==number and r['status']), '')
+                    status='asn_booked' if 'asn' in raw and 'book' in raw else 'dispatched' if 'dispatch' in raw else 'open'
+                    c.execute('UPDATE pos SET status=?,archived=0 WHERE number=?',(status,number))
             for r in records:
                 c.execute('''INSERT INTO regional_po_rows(source_name,sheet,row_number,po_number,region,status,invoice_reference,asn_number,asn_date,item_text,planned_qty,left_qty,due_date,address,customer_po)
                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(source,r['sheet'],r['row'],r['po'],r['region'],r['status'],r['invoice_reference'],r['asn_number'],r['asn_date'],r['item_text'],r['planned_qty'],r['left_qty'],r['due_date'],r['address'],r['customer_po']))
@@ -627,7 +687,8 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
                 c.execute("UPDATE pos SET value=?,address=CASE WHEN address='' THEN ? ELSE address END WHERE number=?",(r['value'],r['address'],number))
                 pid=c.execute('SELECT id FROM pos WHERE number=?',(number,)).fetchone()['id']
                 manual=c.execute('SELECT 1 FROM po_status_events e JOIN pos p ON p.id=e.po_id WHERE p.number=? LIMIT 1',(number,)).fetchone()
-                if not manual:
+                regional_outstanding=bool(c.execute('SELECT 1 FROM regional_po_rows WHERE po_number=? LIMIT 1',(number,)).fetchone())
+                if not manual and not regional_outstanding:
                     status='delivered' if r['stage'] in ('paid','uploaded_not_paid','delivered') else 'open'
                     inv_stage='paid' if r['stage']=='paid' else 'invoiced_up' if r['stage']=='uploaded_not_paid' else 'rcv_needed'
                     c.execute('UPDATE pos SET status=?,invoice_status=?,archived=? WHERE number=?',(status,inv_stage,int(r['stage']=='paid'),number))
@@ -685,10 +746,17 @@ def assign_asn_batch(v:ASNAssignmentBatch,request:Request):
             assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po['id'],)).fetchone()
             if assigned:number=assigned['number']
             else:
-                prefix='M' if po['number'].startswith('300') else 'T'
-                n=1
-                while f'{prefix}{n:04d}' in used:n+=1
-                number=f'{prefix}{n:04d}'
+                old=c.execute('SELECT invoice_reference FROM regional_po_rows WHERE po_number=? AND TRIM(invoice_reference)<>"" ORDER BY id DESC LIMIT 1',(po['number'],)).fetchone()
+                old_number=(old['invoice_reference'] or '').strip().upper() if old else ''
+                if re.fullmatch(r'(?:0\d{2,}|N\d{2,})',old_number):
+                    number=old_number
+                    conflict=c.execute('SELECT po_id FROM po_invoice_numbers WHERE number=?',(number,)).fetchone()
+                    if conflict and conflict['po_id']!=po['id']:fail(f'{number} already belongs to another PO; review before assigning',409)
+                else:
+                    prefix='M' if po['number'].startswith('300') else 'T'
+                    n=1
+                    while f'{prefix}{n:04d}' in used:n+=1
+                    number=f'{prefix}{n:04d}'
                 c.execute('INSERT INTO po_invoice_numbers(po_id,number,assigned_by) VALUES(?,?,?)',(po['id'],number,request.state.user['id']))
                 used.add(number)
             details=f"PO {po['number']} · {po['region'] or 'Unassigned'} · Invoice {number} · {po['address'] or 'No address'}"
@@ -753,6 +821,69 @@ def list_asn_assignments(request:Request):
         if request.state.user['is_admin']:
             return rows(c,"SELECT t.*,p.number po_number,p.region,p.address FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.task_type='asn_booking' ORDER BY CASE t.status WHEN 'submitted' THEN 0 WHEN 'returned' THEN 1 ELSE 2 END,t.id DESC")
         return rows(c,"SELECT t.*,p.number po_number,p.region,p.address FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.task_type='asn_booking' AND t.assigned_to=? ORDER BY t.id DESC",(request.state.user['username'],))
+
+
+class WarehouseAssignment(BaseModel):
+    po_ids:list[int]
+    assigned_to:str
+    due_date:date
+
+
+@app.post('/api/warehouse-assignments')
+def assign_warehouse(v:WarehouseAssignment,request:Request):
+    if not request.state.user['is_admin']:fail('Admin only',403)
+    ids=list(dict.fromkeys(v.po_ids))
+    if not ids or len(ids)>100:fail('Select 1 to 100 POs')
+    with db() as c:
+        target=c.execute('SELECT id,username FROM users WHERE username=? AND active=1',(v.assigned_to.strip(),)).fetchone()
+        if not target:fail('Select an active user')
+        output=[]
+        for po_id in ids:
+            po=c.execute('SELECT * FROM pos WHERE id=?',(po_id,)).fetchone()
+            if not po:fail(f'PO {po_id} not found',404)
+            if po['archived'] or po['status'] in ('delivered','gr_issued'):fail(f"{po['number']} cannot be dispatched")
+            if po['kind']!='marketplace' and po['status']!='asn_booked':fail(f"{po['number']}: ASN must be booked first")
+            if c.execute("SELECT 1 FROM tasks WHERE po_id=? AND task_type='warehouse_dispatch' AND status IN ('open','in_progress')",(po_id,)).fetchone():
+                fail(f"{po['number']} is already assigned to warehouse",409)
+            assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po_id,)).fetchone()
+            source=c.execute('SELECT invoice_reference FROM regional_po_rows WHERE po_number=? ORDER BY id DESC LIMIT 1',(po['number'],)).fetchone()
+            invoice=assigned['number'] if assigned else (source['invoice_reference'] if source else '')
+            details=f"PO {po['number']} · Invoice {invoice or 'Not entered'} · ASN {po['asn_number'] or 'Not required'} · {po['address'] or 'Address not entered'}"
+            task_id=c.execute('''INSERT INTO tasks(title,assigned_to,po_id,due_date,status,details,created_by,task_type,invoice_number,asn_number,asn_date,asn_link)
+              VALUES(?,?,?,?,'open',?,?,'warehouse_dispatch',?,?,?,?)''',
+              ('Prepare and dispatch',target['username'],po_id,v.due_date.isoformat(),details,request.state.user['id'],invoice,po['asn_number'],po['asn_date'],po['asn_link'])).lastrowid
+            output.append({'task_id':task_id,'po_number':po['number']})
+    return {'assignments':output}
+
+
+@app.get('/api/warehouse-assignments')
+def list_warehouse_assignments(request:Request):
+    with db() as c:
+        query="SELECT t.*,p.number po_number,p.kind,p.status po_status,p.address,p.region FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.task_type='warehouse_dispatch'"
+        if request.state.user['is_admin']:return rows(c,query+' ORDER BY t.id DESC')
+        return rows(c,query+' AND t.assigned_to=? ORDER BY t.id DESC',(request.state.user['username'],))
+
+
+class WarehouseUpdate(BaseModel):
+    status:str
+    reason:str=''
+
+
+@app.post('/api/warehouse-assignments/{task_id}/status')
+def warehouse_status(task_id:int,v:WarehouseUpdate,request:Request):
+    if v.status not in ('dispatched','dispatch_cancelled'):fail('Choose Dispatched or Dispatch Cancelled')
+    if v.status=='dispatch_cancelled' and not v.reason.strip():fail('Enter a cancellation reason')
+    with db() as c:
+        task=c.execute("SELECT t.*,p.kind,p.status po_status FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.id=? AND t.task_type='warehouse_dispatch'",(task_id,)).fetchone()
+        if not task:fail('Warehouse assignment not found',404)
+        if task['assigned_to']!=request.state.user['username'] and not request.state.user['is_admin']:fail('Assignment belongs to another user',403)
+        if task['status'] not in ('open','in_progress'):fail('Assignment is already closed')
+        if task['kind']!='marketplace' and task['po_status']!='asn_booked':fail('Tender PO requires booked ASN')
+        if task['po_status'] not in ('open','asn_booked'):fail('PO cannot be dispatched from its current status')
+        c.execute('UPDATE pos SET status=? WHERE id=?',(v.status,task['po_id']))
+        c.execute('UPDATE tasks SET status=?,details=details || CHAR(10) || ? WHERE id=?',('done' if v.status=='dispatched' else 'cancelled',v.reason,task_id))
+        c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(task['po_id'],v.status,v.reason,request.state.user['id']))
+    return {'ok':True,'status':v.status}
 
 @app.post('/api/po-documents/bulk-preview')
 async def soft_copy_preview(files:list[UploadFile]=File(...)):

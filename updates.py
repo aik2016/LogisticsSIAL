@@ -276,7 +276,7 @@ def view_document(document_id:int,request:Request):
 
 @app.post('/api/pos/{po_id}/documents/upload')
 async def upload_related_document(request:Request,po_id:int,document_type:str=Form(...),file:UploadFile=File(...)):
-    allowed={'PO','MRR','RCV','Rejection Form','GR','ASN','Invoice','Odoo Invoice','Nupco Proforma','Nupco Invoice','Delivery Note','Merged Invoice','Other'}
+    allowed={'PO','MRR','RCV','Rejection Form','GR','ASN','Invoice','Odoo Invoice','Nupco Proforma','Nupco Invoice','Delivery Note','Other'}
     if document_type not in allowed:fail('Choose a document type')
     with db() as c:
         if not request.state.user['is_admin'] and not c.execute("SELECT 1 FROM tasks WHERE po_id=? AND assigned_to=? AND task_type='asn_booking' AND status IN ('open','in_progress','returned')",(po_id,request.state.user['username'])).fetchone():
@@ -1035,8 +1035,9 @@ def review_asn(task_id:int,v:ASNReview,request:Request):
             needed={'PO','ASN','Odoo Invoice','Nupco Proforma'} if po['kind']!='marketplace' else {'PO','Odoo Invoice','Nupco Invoice'}
             if po['kind']=='marketplace' and (task['asn_number'] or 'ASN' in types):needed.update(('ASN','Nupco Proforma'))
             if not needed.issubset(types):fail('Missing required documents: '+', '.join(sorted(needed-types)))
-            if not c.execute("SELECT 1 FROM po_documents WHERE po_id=? AND filename=? AND document_type='Merged Invoice'",(task['po_id'],task['invoice_number']+'.pdf')).fetchone():fail('Merge the invoice PDF package before approval')
-            c.execute("UPDATE tasks SET status='done',reviewed_at=CURRENT_TIMESTAMP WHERE id=?",(task_id,))
+            package=c.execute("SELECT id FROM po_documents WHERE po_id=? AND filename=? AND document_type='Merged Invoice' ORDER BY id DESC LIMIT 1",(task['po_id'],task['invoice_number']+'.pdf')).fetchone()
+            if not package:fail('Merge the invoice PDF package before approval')
+            c.execute("UPDATE tasks SET status='done',reviewed_at=CURRENT_TIMESTAMP,package_id=? WHERE id=?",(package['id'],task_id))
             c.execute('UPDATE pos SET status=?,asn_number=?,asn_date=?,asn_link=? WHERE id=?',
                       ('asn_booked' if task['asn_number'] else 'open',task['asn_number'],task['asn_date'],task['asn_link'],task['po_id']))
             c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',
@@ -1081,7 +1082,7 @@ def assign_warehouse(v:WarehouseAssignment,request:Request):
             assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po_id,)).fetchone()
             source=c.execute('SELECT invoice_reference FROM regional_po_rows WHERE po_number=? ORDER BY id DESC LIMIT 1',(po['number'],)).fetchone()
             invoice=assigned['number'] if assigned else (source['invoice_reference'] if source else '')
-            package=c.execute("SELECT id FROM po_documents WHERE po_id=? AND filename=? AND document_type='Merged Invoice' ORDER BY id DESC LIMIT 1",(po_id,invoice+'.pdf')).fetchone()
+            package=c.execute("SELECT package_id id FROM tasks WHERE po_id=? AND invoice_number=? AND task_type='asn_booking' AND status='done' AND package_id IS NOT NULL ORDER BY id DESC LIMIT 1",(po_id,invoice)).fetchone()
             if not c.execute("SELECT 1 FROM invoices i JOIN invoice_lines il ON il.invoice_id=i.id WHERE i.po_id=? AND (i.number=? OR i.reference_number=?) AND i.status='booked'", (po_id,invoice,invoice)).fetchone():
                 fail(f"{po['number']}: book invoice quantities and batches before assignment")
             if not package:fail(f"{po['number']}: merge the invoice package before assignment")

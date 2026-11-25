@@ -82,6 +82,7 @@ def init_db():
         c.execute("UPDATE items SET boxes_per_pallet=9 WHERE boxes_per_pallet=0 AND (code LIKE 'RIM-%' OR code LIKE 'RIB-%')")
         c.execute("UPDATE items SET boxes_per_pallet=12 WHERE boxes_per_pallet=0 AND code LIKE 'CTND-%'")
         c.execute("UPDATE pos SET invoice_status='' WHERE invoice_status='rcv_needed' AND status='open' AND NOT EXISTS (SELECT 1 FROM invoices WHERE invoices.po_id=pos.id)")
+        c.execute("UPDATE pos SET customer_po='' WHERE kind!='marketplace' AND customer_po<>''")
 
 
 init_db()
@@ -98,6 +99,7 @@ def missing(message):
 def outstanding_by_line(c, lines):
     """Allocate report balances to the latest due lines, then account for new deliveries."""
     snapshots={(r['po_id'],r['item_code']):r['remaining_qty'] for r in rows(c,'SELECT po_id,item_code,remaining_qty FROM po_remaining_snapshot')}
+    snapshot_pos={po_id for po_id,_ in snapshots}
     grouped={}
     for line in lines:grouped.setdefault((line['po_id'],line['item_code']),[]).append(line)
     result={}
@@ -108,6 +110,8 @@ def outstanding_by_line(c, lines):
                 base=min(line['quantity'],remaining)
                 remaining-=base
                 result[line['id']]=max(0,base-(line.get('delivered_qty') or 0)-(line.get('cancelled_qty') or 0))
+        elif key[0] in snapshot_pos:
+            for line in group:result[line['id']]=0
         else:
             for line in group:result[line['id']]=max(0,line['quantity']-(line.get('delivered_qty') or 0)-(line.get('cancelled_qty') or 0))
     return result
@@ -270,6 +274,7 @@ def dashboard_data():
                 quantity_text=str(regional['left_qty'] or regional['planned_qty'] or '0').replace(',','')
                 try:quantity=int(float(quantity_text))
                 except ValueError:quantity=0
+                if quantity<=0 or not parent['is_outstanding']:continue
                 item={'po_id':parent['id'],'number':parent['number'],'item_code':regional['item_text'],
                       'ordered_qty':quantity,'delivered_qty':0,'region':regional['region'],
                       'due_date':raw_date,'days_to_due':days,'source_status':regional['status']}
@@ -308,7 +313,7 @@ def dashboard(request:Request):
     perms=set(user['permissions'].split(','))
     if not perms & {'pos_edit','invoice_edit','issue_edit','task_edit'}:
         assigned={t['po_id'] for t in data['tasks'] if t['assigned_to']==user['username'] and t['po_id'] is not None}
-        data['pos']=[p for p in data['pos'] if p['id'] in assigned or p['added_from_pdf']]
+        data['pos']=[p for p in data['pos'] if p['id'] in assigned]
         numbers={p['number'] for p in data['pos']}
         data['lines']=[x for x in data['lines'] if x['po_number'] in numbers]
         data['reminders']=[x for x in data['reminders'] if x['po_id'] in assigned]

@@ -41,12 +41,23 @@ def region_from_address(address):
 @app.get('/api/export/masterlist.xlsx')
 def export_masterlist():
     book=Workbook();tender=book.active;tender.title='Tender';market=book.create_sheet('Marketplace')
-    header=['PO number','Item','Quantity','Due date','Delivery address','PO value (SAR)','Creation date']
+    header=['PO Number','Item Code','Qty','Due Date','Delivery Address','Total Value','Creation Date']
     for sheet in (tender,market):sheet.append(header)
     with db() as c:
-        records=rows(c,'SELECT p.number,p.kind,p.value,p.po_created_at,l.item_code,l.quantity,l.due_date,l.address FROM pos p JOIN po_lines l ON l.po_id=p.id ORDER BY p.number,l.line_no')
+        records=rows(c,'SELECT p.number,p.kind,p.value,p.po_created_at,l.item_code,l.quantity,l.due_date,l.address,l.line_no FROM pos p JOIN po_lines l ON l.po_id=p.id ORDER BY p.number,l.line_no')
+        source=rows(c,"SELECT row_json FROM source_rows WHERE source_name=(SELECT source_name FROM source_rows WHERE source_name LIKE 'masterlist:%' ORDER BY id DESC LIMIT 1) ORDER BY id")
+    line_values=defaultdict(list)
+    for row in source:
+        entry=json.loads(row['row_json'])
+        line_values[entry['po']].append(entry['value'])
+    line_index=defaultdict(int)
+    line_count=defaultdict(int)
+    for r in records:line_count[r['number']]+=1
     for r in records:
-        (market if r['kind']=='marketplace' else tender).append([r['number'],r['item_code'],r['quantity'],r['due_date'],r['address'],r['value'],r['po_created_at']])
+        index=line_index[r['number']];line_index[r['number']]+=1
+        values=line_values.get(r['number'],[])
+        value=values[index] if index<len(values) else r['value'] if line_count[r['number']]==1 else None
+        (market if r['kind']=='marketplace' else tender).append([r['number'],r['item_code'],r['quantity'],r['due_date'],r['address'],value,r['po_created_at']])
     out=io.BytesIO();book.save(out);out.seek(0)
     return StreamingResponse(out,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="sial-po-masterlist.xlsx"'})
 
@@ -431,6 +442,16 @@ async def merge_pdfs(files: list[UploadFile] = File(...)):
     return StreamingResponse(output, media_type='application/pdf', headers={'Content-Disposition':'attachment; filename="merged-po-documents.pdf"'})
 
 
+def existing_legacy_number(c, po_number):
+    for table in ('regional_po_rows', 'source_status'):
+        matches=rows(c,f'''SELECT invoice_reference FROM {table} WHERE po_number=?
+            AND TRIM(invoice_reference)<>'' ORDER BY id DESC''',(po_number,))
+        for match in matches:
+            value=(match['invoice_reference'] or '').strip().upper()
+            if re.fullmatch(r'(?:0\d{2,}|N\d{2,})',value):return value
+    return ''
+
+
 @app.get('/api/invoices/next-number')
 def next_invoice_number(po_id: int):
     with db() as c:
@@ -438,8 +459,7 @@ def next_invoice_number(po_id: int):
         if not po: fail('PO not found',404)
         assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po_id,)).fetchone()
         if assigned:return {'next_number':assigned['number'],'prefix':assigned['number'][0],'reused':True}
-        old=c.execute('SELECT invoice_reference FROM regional_po_rows WHERE po_number=? AND TRIM(invoice_reference)<>"" ORDER BY id DESC LIMIT 1',(po['number'],)).fetchone()
-        old_number=(old['invoice_reference'] or '').strip().upper() if old else ''
+        old_number=existing_legacy_number(c,po['number'])
         if re.fullmatch(r'(?:0\d{2,}|N\d{2,})',old_number):
             return {'next_number':old_number,'prefix':old_number[0],'reused':True}
         prefix = 'M' if po['number'].startswith('300') else 'T'
@@ -866,7 +886,7 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
             for r in records:
                 c.execute('''INSERT INTO regional_po_rows(source_name,sheet,row_number,po_number,region,status,invoice_reference,asn_number,asn_date,item_text,planned_qty,left_qty,due_date,address,customer_po)
                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(source,r['sheet'],r['row'],r['po'],r['region'],r['status'],r['invoice_reference'],r['asn_number'],r['asn_date'],r['item_text'],r['planned_qty'],r['left_qty'],r['due_date'],r['address'],r['customer_po']))
-                c.execute("UPDATE pos SET address=CASE WHEN address='' THEN ? ELSE address END,customer_po=CASE WHEN customer_po='' THEN ? ELSE customer_po END,asn_number=CASE WHEN asn_number='' THEN ? ELSE asn_number END,asn_date=CASE WHEN asn_date='' THEN ? ELSE asn_date END WHERE number=?",
+                c.execute("UPDATE pos SET address=CASE WHEN address='' THEN ? ELSE address END,customer_po=CASE WHEN kind='marketplace' AND customer_po='' THEN ? ELSE customer_po END,asn_number=CASE WHEN asn_number='' THEN ? ELSE asn_number END,asn_date=CASE WHEN asn_date='' THEN ? ELSE asn_date END WHERE number=?",
                           (r['address'],r['customer_po'],r['asn_number'],r['asn_date'],r['po']))
             balances=defaultdict(lambda:defaultdict(int))
             for r in records:
@@ -948,8 +968,7 @@ def assign_asn_batch(v:ASNAssignmentBatch,request:Request):
             assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po['id'],)).fetchone()
             if assigned:number=assigned['number']
             else:
-                old=c.execute('SELECT invoice_reference FROM regional_po_rows WHERE po_number=? AND TRIM(invoice_reference)<>"" ORDER BY id DESC LIMIT 1',(po['number'],)).fetchone()
-                old_number=(old['invoice_reference'] or '').strip().upper() if old else ''
+                old_number=existing_legacy_number(c,po['number'])
                 if re.fullmatch(r'(?:0\d{2,}|N\d{2,})',old_number):
                     number=old_number
                     conflict=c.execute('SELECT po_id FROM po_invoice_numbers WHERE number=?',(number,)).fetchone()

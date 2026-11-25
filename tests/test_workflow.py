@@ -86,6 +86,19 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(r.status_code,403)
         self.assertNotEqual(helper,1)
 
+    def test_regional_balance_excludes_unlisted_items_and_keeps_old_invoice(self):
+        self.call('items',{'code':'RIM-65','pcs_per_box':200,'boxes_per_pallet':9})
+        self.call('items',{'code':'RIM-75','pcs_per_box':200,'boxes_per_pallet':9})
+        po=self.call('pos',{'number':'4600999988','kind':'tender'})['id']
+        self.call(f'pos/{po}/lines',{'line_no':'0010','item_code':'RIM-65','quantity':800,'due_date':'2027-01-01'})
+        self.call(f'pos/{po}/lines',{'line_no':'0020','item_code':'RIM-75','quantity':1000,'due_date':'2027-01-01'})
+        with db() as c:
+            c.execute('INSERT INTO po_remaining_snapshot(po_id,item_code,remaining_qty,source_name) VALUES(?,?,?,?)',(po,'RIM-75',300,'due_region:test'))
+            c.execute('INSERT INTO regional_po_rows(source_name,sheet,row_number,po_number,region,invoice_reference) VALUES(?,?,?,?,?,?)',('due_region:test','RUH',1,'4600999988','Riyadh','N0120'))
+        record=next(p for p in self.client.get('/api/dashboard').json()['pos'] if p['id']==po)
+        self.assertEqual(record['remaining_qty'],300)
+        self.assertEqual(self.client.get('/api/invoices/next-number',params={'po_id':po}).json()['next_number'],'N0120')
+
     def test_starting_stock_import_is_idempotent(self):
         content=workbook({'Stock':[['Item Code','Batch No','Quantity','Manufacturing Date','Expiry Date'],['RIB-35','LOT-1',600,'01.01.2026','01.01.2029']]})
         r=self.client.post('/api/inventory/starting-preview',files={'file':('stock.xlsx',content)},headers=self.headers)

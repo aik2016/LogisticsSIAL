@@ -253,6 +253,19 @@ class Task(BaseModel):
     details: str = ''
 
 
+RELEASE='20261125-10'
+
+@app.get('/release')
+def release():
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(RELEASE, headers={'Cache-Control':'no-store'})
+
+def is_direct_ngh(po):
+    address=((po['address'] or '')+' '+(po['address_ar'] or '')).lower()
+    customer=(po['customer'] or '').lower()
+    return (po['number'].startswith('300') and not any(x in address for x in ('nupco','نوبكو'))
+            and any(x in address+' '+customer for x in ('ngh','national guard','الحرس الوطني')))
+
 @app.get('/')
 def home():
     return FileResponse(ROOT / 'static' / 'index.html', headers={'Cache-Control': 'no-store, must-revalidate'})
@@ -270,6 +283,12 @@ def dashboard_data():
           (SELECT ss.stage FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_stage,
           COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE i.po_id=p.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
           FROM pos p LEFT JOIN po_lines l ON l.po_id=p.id GROUP BY p.id ORDER BY due_date''')
+        nupco_paid={r['number'] for r in rows(c,"""SELECT DISTINCT p.number
+          FROM nupco_records n JOIN pos p ON p.number=n.po_number OR
+            (n.po_number='' AND n.supplier_reference<>'' AND EXISTS (
+              SELECT 1 FROM invoices i WHERE i.po_id=p.id AND
+                (i.number=n.supplier_reference OR i.reference_number=n.supplier_reference)))
+          WHERE n.kind IN ('invoicing','invoices') AND LOWER(TRIM(n.status))='paid'""")}
         for p in pos:
             due = date.fromisoformat(p['due_date']) if p['due_date'] else None
             p['days_to_due'] = (due-today).days if due else None
@@ -299,7 +318,12 @@ def dashboard_data():
         regional_pos={r['po_number'] for r in region_rows}
         for p in pos:
             p['is_outstanding']=(p['number'] in regional_pos or bool(p['added_from_pdf'])) and not p['archived'] and p['status'] not in ('dispatched','delivered','gr_issued')
-            p['is_ngh']=p['number'].startswith('300') and 'nupco' not in (p['address'] or '').lower() and 'nupco' not in (p['address_ar'] or '').lower() and any(term in ((p['address'] or '')+' '+(p['customer'] or '')).lower() for term in ('ngh','national guard','mngha'))
+            p['is_ngh']=is_direct_ngh(p)
+            cancelled=c.execute('SELECT COALESCE(SUM(cancelled_qty),0) FROM po_lines WHERE po_id=?',(p['id'],)).fetchone()[0]
+            ordered=p['ordered_qty'] or 0
+            p['payable_amount']=round((p['value'] or 0)*max(0,ordered-cancelled)/ordered,2) if ordered else p['value'] or 0
+            p['awaiting_payment_review']=(p['invoice_status']=='paid' or p['source_stage']=='paid' or p['number'] in nupco_paid) and not p['paid_amount'] and p['invoice_status']!='partially_paid'
+
         due_lines = rows(c, '''SELECT p.id po_id,p.number,p.customer,p.customer_po,p.region,p.value,p.status,p.overdue_reason,
            l.id,l.line_no,l.item_code,l.quantity,l.quantity ordered_qty,l.cancelled_qty,l.due_date,
            COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
@@ -380,7 +404,7 @@ def dashboard(request:Request):
         return data
     if user['is_admin'] or 'reports_view' in user['permissions'].split(','): return data
     perms=set(user['permissions'].split(','))
-    if not perms & {'pos_edit','invoice_edit','issue_edit','task_edit'}:
+    if not perms & {'pos_edit','invoice_edit','issue_edit','task_edit','accounting_edit'}:
         assigned={t['po_id'] for t in data['tasks'] if t['assigned_to']==user['username'] and t['po_id'] is not None}
         data['pos']=[p for p in data['pos'] if p['id'] in assigned]
         numbers={p['number'] for p in data['pos']}
@@ -588,17 +612,21 @@ def reports():
     pos=dashboard['pos']
     metrics={'all_po_value':sum(p['value'] or 0 for p in pos),
              'outstanding_value':sum((p['value'] or 0)*(p['remaining_qty'] or 0)/(p['ordered_qty'] or 1) for p in pos if p['is_outstanding']),
-             'paid_value':sum((p['paid_amount'] or 0) if p['paid_amount'] else (p['value'] or 0) if p['source_stage']=='paid' else 0 for p in pos),
+             'paid_value':sum(p['paid_amount'] or 0 for p in pos),
              'marketplace_value':sum(p['value'] or 0 for p in pos if p['kind']=='marketplace'),
              'tender_value':sum(p['value'] or 0 for p in pos if p['kind']!='marketplace'),
-             'uploaded_unpaid_value':sum(p['value'] or 0 for p in pos if p['invoice_status']=='invoiced_up')}
+             'uploaded_unpaid_value':0}
     with db() as c:
+        uploaded=rows(c,"SELECT po_id,SUM(CASE WHEN payment_status!='paid' AND status!='paid' THEN value ELSE 0 END) unpaid FROM invoices WHERE uploaded_at IS NOT NULL OR status IN ('uploaded','paid') GROUP BY po_id")
+        uploaded_by_po={row['po_id']:row['unpaid'] or 0 for row in uploaded}
+        metrics['uploaded_unpaid_value']=sum(uploaded_by_po.values())+sum(
+            p['payable_amount'] for p in pos if p['id'] not in uploaded_by_po and p['invoice_status']=='invoiced_up')
         return {'metrics':metrics,
                 'by_region':rows(c,'SELECT region,COUNT(*) po_count,SUM(value) value FROM pos GROUP BY region'),
                 'by_item':rows(c,'SELECT item_code,SUM(quantity) quantity FROM po_lines GROUP BY item_code'),
                 'invoice_status':rows(c,'SELECT status,COUNT(*) count,SUM(value) value FROM invoices GROUP BY status'),
                 'tasks':rows(c,'SELECT assigned_to,status,COUNT(*) count FROM tasks GROUP BY assigned_to,status'),
-                'dispatched_by_month':rows(c,"SELECT substr(COALESCE(dispatched_at,''),1,7) month,il.batch_id,b.item_code,SUM(il.quantity) quantity FROM invoices i JOIN invoice_lines il ON il.invoice_id=i.id JOIN batches b ON b.id=il.batch_id WHERE i.dispatched_at IS NOT NULL GROUP BY month,il.batch_id,b.item_code ORDER BY month DESC")}
+                'dispatched_by_month':rows(c,"SELECT substr(COALESCE(dispatched_at,''),1,7) month,il.batch_id,b.item_code,b.batch_no,SUM(il.quantity) quantity FROM invoices i JOIN invoice_lines il ON il.invoice_id=i.id JOIN batches b ON b.id=il.batch_id WHERE i.dispatched_at IS NOT NULL GROUP BY month,il.batch_id,b.item_code ORDER BY month DESC")}
 
 
 @app.get('/api/export/pos.csv')

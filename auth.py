@@ -80,7 +80,7 @@ async def protect(request:Request,call_next):
     path=request.url.path
     if getattr(app.state,'maintenance',False) and path.startswith('/api/'):
         return JSONResponse({'detail':'Database maintenance in progress; retry shortly'},status_code=503)
-    if path=='/' or path in ('/api/auth/login','/api/auth/logout','/api/auth/reset-request','/api/auth/reset-confirm'):
+    if path in ('/','/release') or path in ('/api/auth/login','/api/auth/logout','/api/auth/reset-request','/api/auth/reset-confirm'):
         return await call_next(request)
     if not path.startswith('/api/') and path not in ('/docs','/openapi.json','/redoc'):
         return await call_next(request)

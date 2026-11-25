@@ -18,7 +18,7 @@ from openpyxl import load_workbook, Workbook
 from pydantic import BaseModel
 from pypdf import PdfReader, PdfWriter
 
-from app import DB, app, business_today, db, rows, pallet_size, outstanding_by_line, dashboard_data, regional_item_quantities
+from app import DB, app, business_today, db, rows, pallet_size, outstanding_by_line, dashboard_data, regional_item_quantities, is_direct_ngh
 from imports import decode as decode_master, money, qty
 
 DOCS = Path(os.getenv('LOGISTICS_DOCUMENTS', DB.parent / 'documents'))
@@ -523,12 +523,15 @@ def record_payment(po_id:int,v:PaymentUpdate,request:Request):
     user=request.state.user
     if not user['is_admin'] and ('accounting_edit' not in user['permissions'].split(',') or user['role']!='accountant'):
         fail('Accountant permission required',403)
-    if v.amount_sar<0 or v.kind not in ('partial','complete'):fail('Enter a valid SAR amount and payment type')
+    if not math.isfinite(v.amount_sar) or v.amount_sar<=0 or v.kind not in ('partial','complete'):fail('Enter a valid SAR amount and payment type')
     if v.kind=='partial' and not v.reason.strip():fail('Explain why payment is partial')
+    record=next((p for p in dashboard_data()['pos'] if p['id']==po_id),None)
+    if not record:fail('PO not found',404)
+    if v.kind=='complete' and record['remaining_qty']>0 and record['is_outstanding']:fail('Resolve outstanding quantities before recording complete payment')
     with db() as c:
         po=c.execute('SELECT id,status,value FROM pos WHERE id=?',(po_id,)).fetchone()
         if not po:fail('PO not found',404)
-        if po['status'] not in ('delivered','gr_issued'):fail('Payment requires delivered or GR issued PO')
+        if po['status'] not in ('delivered','gr_issued') and not record['awaiting_payment_review']:fail('Payment requires delivery or reported payment')
         c.execute('UPDATE pos SET paid_amount=?,payment_reason=?,invoice_status=?,archived=? WHERE id=?',
                   (round(v.amount_sar,2),v.reason.strip(),'paid' if v.kind=='complete' else 'partially_paid',int(v.kind=='complete'),po_id))
         c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',
@@ -545,9 +548,9 @@ class DueReschedule(BaseModel):
 def reschedule_ngh(line_id:int,v:DueReschedule,request:Request):
     if not v.reason.strip():fail('Enter a rescheduling reason')
     with db() as c:
-        row=c.execute('SELECT l.po_id,p.number,p.address,p.customer FROM po_lines l JOIN pos p ON p.id=l.po_id WHERE l.id=?',(line_id,)).fetchone()
+        row=c.execute('SELECT l.po_id,p.number,p.address,p.address_ar,p.customer FROM po_lines l JOIN pos p ON p.id=l.po_id WHERE l.id=?',(line_id,)).fetchone()
         if not row:fail('PO line not found',404)
-        if not row['number'].startswith('300') or 'nupco' in (row['address'] or '').lower() or not any(x in ((row['address'] or '')+' '+(row['customer'] or '')).lower() for x in ('ngh','mngha','national guard')):fail('NGH direct delivery PO required')
+        if not is_direct_ngh(row):fail('NGH direct delivery PO required')
         c.execute('UPDATE po_lines SET due_date=? WHERE id=?',(v.due_date.isoformat(),line_id))
         c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(row['po_id'],'due_rescheduled',v.reason.strip(),request.state.user['id']))
     return {'ok':True}

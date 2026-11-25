@@ -82,6 +82,18 @@ def init_db():
             c.execute('ALTER TABLE tasks ADD COLUMN package_id INTEGER')
         if 'shipment_invoice_id' not in [r['name'] for r in c.execute('PRAGMA table_info(tasks)')]:
             c.execute('ALTER TABLE tasks ADD COLUMN shipment_invoice_id INTEGER')
+        c.execute('''UPDATE tasks SET package_id=(
+            SELECT MIN(d.id) FROM po_documents d WHERE d.po_id=tasks.po_id
+              AND d.filename=tasks.invoice_number||'.pdf' AND d.document_type='Merged Invoice'
+            HAVING COUNT(*)=1)
+            WHERE package_id IS NULL AND task_type IN ('asn_booking','warehouse_dispatch')
+              AND (task_type='warehouse_dispatch' OR status='done')''')
+        c.execute('''UPDATE tasks SET shipment_invoice_id=(
+            SELECT MIN(i.id) FROM invoices i WHERE i.po_id=tasks.po_id
+              AND (i.number=tasks.invoice_number OR i.reference_number=tasks.invoice_number)
+              AND i.status='booked' HAVING COUNT(*)=1)
+            WHERE shipment_invoice_id IS NULL AND task_type='warehouse_dispatch'
+              AND status IN ('open','in_progress')''')
         # Apply family defaults only to items whose pallet size is still unknown.
         c.execute("UPDATE items SET boxes_per_pallet=14 WHERE boxes_per_pallet=0 AND code LIKE 'RIMZP-%'")
         c.execute("UPDATE items SET boxes_per_pallet=9 WHERE boxes_per_pallet=0 AND (code LIKE 'RIM-%' OR code LIKE 'RIB-%')")

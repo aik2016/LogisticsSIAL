@@ -1128,6 +1128,7 @@ def warehouse_status(task_id:int,v:WarehouseUpdate,request:Request):
         if task['status'] not in ('open','in_progress'):fail('Assignment is already closed')
         if task['kind']!='marketplace' and task['po_status']!='asn_booked':fail('Tender PO requires booked ASN')
         if task['po_status'] not in ('open','asn_booked'):fail('PO cannot be dispatched from its current status')
+        if v.status=='dispatched' and (not task['package_id'] or not task['shipment_invoice_id']):fail('This assignment needs a reviewed package and booked shipment')
         if v.status=='dispatched':
             c.execute("UPDATE invoices SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status='booked'",(task['shipment_invoice_id'],))
         c.execute('UPDATE pos SET status=? WHERE id=?',(v.status,task['po_id']))

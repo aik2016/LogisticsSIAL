@@ -18,7 +18,7 @@ from openpyxl import load_workbook, Workbook
 from pydantic import BaseModel
 from pypdf import PdfReader, PdfWriter
 
-from app import DB, app, business_today, db, rows, pallet_size, outstanding_by_line, dashboard_data
+from app import DB, app, business_today, db, rows, pallet_size, outstanding_by_line, dashboard_data, regional_item_quantities
 from imports import decode as decode_master, money, qty
 
 DOCS = Path(os.getenv('LOGISTICS_DOCUMENTS', DB.parent / 'documents'))
@@ -44,20 +44,9 @@ def export_masterlist():
     header=['PO Number','Item Code','Qty','Due Date','Delivery Address','Total Value','Creation Date']
     for sheet in (tender,market):sheet.append(header)
     with db() as c:
-        records=rows(c,'SELECT p.number,p.kind,p.value,p.po_created_at,l.item_code,l.quantity,l.due_date,l.address,l.line_no FROM pos p JOIN po_lines l ON l.po_id=p.id ORDER BY p.number,l.line_no')
-        source=rows(c,"SELECT row_json FROM source_rows WHERE source_name=(SELECT source_name FROM source_rows WHERE source_name LIKE 'masterlist:%' ORDER BY id DESC LIMIT 1) ORDER BY id")
-    line_values=defaultdict(list)
-    for row in source:
-        entry=json.loads(row['row_json'])
-        line_values[entry['po']].append(entry['value'])
-    line_index=defaultdict(int)
-    line_count=defaultdict(int)
-    for r in records:line_count[r['number']]+=1
+        records=rows(c,'SELECT p.number,p.kind,p.value,p.po_created_at,l.item_code,l.quantity,l.due_date,l.address FROM pos p JOIN po_lines l ON l.po_id=p.id ORDER BY p.number,l.line_no')
     for r in records:
-        index=line_index[r['number']];line_index[r['number']]+=1
-        values=line_values.get(r['number'],[])
-        value=values[index] if index<len(values) else r['value'] if line_count[r['number']]==1 else None
-        (market if r['kind']=='marketplace' else tender).append([r['number'],r['item_code'],r['quantity'],r['due_date'],r['address'],value,r['po_created_at']])
+        (market if r['kind']=='marketplace' else tender).append([r['number'],r['item_code'],r['quantity'],r['due_date'],r['address'],r['value'],r['po_created_at']])
     out=io.BytesIO();book.save(out);out.seek(0)
     return StreamingResponse(out,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="sial-po-masterlist.xlsx"'})
 
@@ -890,9 +879,9 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
                           (r['address'],r['customer_po'],r['asn_number'],r['asn_date'],r['po']))
             balances=defaultdict(lambda:defaultdict(int))
             for r in records:
-                codes=re.findall(r'\b(?:CTND|RIMZP|RIM|RIB)-\d+\b',r['item_text'])
-                raw=str(r['left_qty'] if r['left_qty']!='' else r['planned_qty']).replace(',','')
-                if len(codes)==1 and raw.isdigit():balances[r['po']][codes[0]]+=int(raw)
+                raw=r['left_qty'] if r['left_qty']!='' else r['planned_qty']
+                for code,count in regional_item_quantities(r['item_text'],raw):
+                    balances[r['po']][code]+=count
             for number,by_code in balances.items():
                 pid=c.execute('SELECT id FROM pos WHERE number=?',(number,)).fetchone()['id']
                 for code,count in by_code.items():

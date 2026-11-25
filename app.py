@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -99,6 +100,16 @@ def missing(message):
 def outstanding_by_line(c, lines):
     """Allocate report balances to the latest due lines, then account for new deliveries."""
     snapshots={(r['po_id'],r['item_code']):r['remaining_qty'] for r in rows(c,'SELECT po_id,item_code,remaining_qty FROM po_remaining_snapshot')}
+    regional=rows(c,'''SELECT p.id po_id,r.item_text,r.left_qty,r.planned_qty FROM regional_po_rows r
+        JOIN pos p ON p.number=r.po_number WHERE r.source_name=
+        (SELECT source_name FROM regional_po_rows ORDER BY id DESC LIMIT 1)''')
+    parsed_regional={}
+    for row in regional:
+        quantity=row['left_qty'] if row['left_qty']!='' else row['planned_qty']
+        for code,count in regional_item_quantities(row['item_text'],quantity):
+            key=(row['po_id'],code)
+            parsed_regional[key]=parsed_regional.get(key,0)+count
+    for key,count in parsed_regional.items():snapshots.setdefault(key,count)
     snapshot_pos={po_id for po_id,_ in snapshots}
     grouped={}
     for line in lines:grouped.setdefault((line['po_id'],line['item_code']),[]).append(line)
@@ -115,6 +126,21 @@ def outstanding_by_line(c, lines):
         else:
             for line in group:result[line['id']]=max(0,line['quantity']-(line.get('delivered_qty') or 0)-(line.get('cancelled_qty') or 0))
     return result
+
+
+def regional_item_quantities(item_text, quantity_text):
+    """Read item quantities from the regional workbook, including its compact two-item rows."""
+    text=str(item_text or '').strip().upper()
+    raw=str(quantity_text or '').replace(',','').strip()
+    code=re.search(r'\b(?:CTND|RIMZP|RIM|RIB)-\d+\b',text)
+    if code and raw.isdigit():return [(code.group(),int(raw))]
+    compact=re.fullmatch(r'(RIMZP|RIM|RIB)\s+(\d+),(\d+)',text)
+    amounts=re.fullmatch(r'(\d+)\.(\d)',raw)
+    if compact and amounts:
+        family,first,second=compact.groups()
+        return [(f'{family}-{first}',int(amounts.group(1))),
+                (f'{family}-{second}',int(amounts.group(2))*100)]
+    return []
 
 
 class Item(BaseModel):
@@ -230,8 +256,17 @@ def dashboard_data():
         invoices = rows(c, '''SELECT i.*,p.number po_number,
           COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il WHERE il.invoice_id=i.id),0) quantity
           FROM invoices i JOIN pos p ON p.id=i.po_id ORDER BY i.id DESC''')
-        region_rows=rows(c,'''SELECT r.* FROM regional_po_rows r WHERE r.source_name=
+        raw_region_rows=rows(c,'''SELECT r.* FROM regional_po_rows r WHERE r.source_name=
           (SELECT source_name FROM regional_po_rows ORDER BY id DESC LIMIT 1) ORDER BY po_number,row_number''')
+        region_rows=[]
+        for row in raw_region_rows:
+            quantity=row['left_qty'] if row['left_qty']!='' else row['planned_qty']
+            parsed=regional_item_quantities(row['item_text'],quantity)
+            if len(parsed)>1:
+                for code,count in parsed:
+                    expanded=dict(row);expanded['item_text']=code;expanded['planned_qty']=str(count)
+                    expanded['left_qty']=str(count);region_rows.append(expanded)
+            else:region_rows.append(row)
         regional_pos={r['po_number'] for r in region_rows}
         for p in pos:
             p['is_outstanding']=(p['number'] in regional_pos or bool(p['added_from_pdf'])) and not p['archived'] and p['status'] not in ('dispatched','delivered','gr_issued')

@@ -8,7 +8,7 @@ from openpyxl import Workbook
 from fastapi.testclient import TestClient
 
 os.environ['LOGISTICS_DB'] = tempfile.mktemp(suffix='.db')
-from app import app, db
+from app import app, db, regional_item_quantities
 from auth import hash_password
 
 
@@ -87,6 +87,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertNotEqual(helper,1)
 
     def test_regional_balance_excludes_unlisted_items_and_keeps_old_invoice(self):
+        self.assertEqual(regional_item_quantities('RIM 75,65','1000.8'),[('RIM-75',1000),('RIM-65',800)])
         self.call('items',{'code':'RIM-65','pcs_per_box':200,'boxes_per_pallet':9})
         self.call('items',{'code':'RIM-75','pcs_per_box':200,'boxes_per_pallet':9})
         po=self.call('pos',{'number':'4600999988','kind':'tender'})['id']

@@ -78,6 +78,8 @@ def init_db():
         for column,definition in [('created_by','INTEGER'),('task_type',"TEXT DEFAULT ''"),('invoice_number',"TEXT DEFAULT ''"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''"),('asn_remarks',"TEXT DEFAULT ''"),('planned_delivery_date',"TEXT DEFAULT ''"),('submitted_at','TEXT'),('reviewed_at','TEXT')]:
             if column not in [r['name'] for r in c.execute('PRAGMA table_info(tasks)')]:
                 c.execute(f'ALTER TABLE tasks ADD COLUMN {column} {definition}')
+        if 'package_id' not in [r['name'] for r in c.execute('PRAGMA table_info(tasks)')]:
+            c.execute('ALTER TABLE tasks ADD COLUMN package_id INTEGER')
         # Apply family defaults only to items whose pallet size is still unknown.
         c.execute("UPDATE items SET boxes_per_pallet=14 WHERE boxes_per_pallet=0 AND code LIKE 'RIMZP-%'")
         c.execute("UPDATE items SET boxes_per_pallet=9 WHERE boxes_per_pallet=0 AND (code LIKE 'RIM-%' OR code LIKE 'RIB-%')")
@@ -125,6 +127,19 @@ def outstanding_by_line(c, lines):
             for line in group:result[line['id']]=0
         else:
             for line in group:result[line['id']]=max(0,line['quantity']-(line.get('delivered_qty') or 0)-(line.get('cancelled_qty') or 0))
+    po_ids={line['po_id'] for line in lines}
+    returned=rows(c,"""SELECT invoice_id,batch_id,SUM(quantity) quantity FROM movements
+        WHERE type='return' GROUP BY invoice_id,batch_id""")
+    for entry in returned:
+        quantity=entry['quantity']
+        matched=rows(c,"""SELECT il.po_line_id,il.quantity,l.po_id FROM invoice_lines il
+            JOIN po_lines l ON l.id=il.po_line_id WHERE il.invoice_id=? AND il.batch_id=? ORDER BY il.id""",
+            (entry['invoice_id'],entry['batch_id']))
+        for line in matched:
+            allocated=min(quantity,line['quantity'])
+            quantity-=allocated
+            if line['po_id'] in po_ids and line['po_line_id'] in result:
+                result[line['po_line_id']]+=allocated
     return result
 
 
@@ -319,6 +334,10 @@ def dashboard_data():
                 p['urgent']=any(x['po_id']==p['id'] for x in urgent)
                 p['reminder']=any(x['po_id']==p['id'] for x in reminders)
         batch_rows=rows(c,'''SELECT b.*,b.quantity-COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.batch_id=b.id AND i.status IN ('booked','dispatched')),0) free_quantity FROM batches b ORDER BY b.id DESC''')
+        for po in pos:
+            if po['delivered_qty'] and not c.execute('SELECT 1 FROM po_remaining_snapshot WHERE po_id=?',(po['id'],)).fetchone():
+                returned=c.execute("SELECT COALESCE(SUM(m.quantity),0) FROM movements m JOIN invoices i ON i.id=m.invoice_id WHERE i.po_id=? AND m.type='return'",(po['id'],)).fetchone()[0]
+                po['delivered_qty']=max(0,po['delivered_qty']-returned)
         return {'pos':pos,'stock':stock,'batches':batch_rows, 'invoices':invoices,
                 'issues':rows(c,'SELECT * FROM issues ORDER BY id DESC'), 'tasks':rows(c,'SELECT * FROM tasks ORDER BY id DESC'),
                 'lines':rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date'),
@@ -338,7 +357,8 @@ def dashboard(request:Request):
         data['pos']=[p for p in data['pos'] if p['id'] in assigned]
         numbers={p['number'] for p in data['pos']}
         data['lines']=[x for x in data['lines'] if x['po_number'] in numbers]
-        data['documents']=[x for x in data['documents'] if x['po_id'] in assigned]
+        packages={t['package_id'] for t in data['tasks'] if t['assigned_to']==user['username'] and t.get('task_type')=='warehouse_dispatch'}
+        data['documents']=[x for x in data['documents'] if x['id'] in packages]
         data['tasks']=[x for x in data['tasks'] if x['assigned_to']==user['username'] and x.get('task_type')=='warehouse_dispatch']
         data['regional_rows']=[];data['reminders']=[];data['urgent']=[];data['issues']=[]
         data['stock']=[];data['batches']=[];data['invoices']=[];data['assigned_invoice_numbers']=[]
@@ -489,6 +509,8 @@ def invoice_status(invoice_id:int,v:Status):
         if column: c.execute(f'UPDATE invoices SET status=?,{column}=? WHERE id=?',(v.status,v.when or business_today().isoformat(),invoice_id))
         else: c.execute('UPDATE invoices SET status=? WHERE id=?',(v.status,invoice_id))
         po_id=inv['po_id']
+        if v.status=='cancelled' and not c.execute("SELECT 1 FROM invoices WHERE po_id=? AND status='dispatched'",(po_id,)).fetchone():
+            c.execute("UPDATE pos SET status='dispatch_cancelled' WHERE id=? AND status='dispatched'",(po_id,))
         if v.status in ('dispatched','delivered','gr_issued'):
             totals=c.execute('''SELECT COALESCE(SUM(l.quantity),0) ordered,
               COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
@@ -498,8 +520,8 @@ def invoice_status(invoice_id:int,v:Status):
                 c.execute("UPDATE pos SET status='dispatched' WHERE id=? AND status IN ('open','asn_booked')",(po_id,))
             elif totals['ordered'] and totals['delivered']>=totals['ordered']:
                 c.execute('UPDATE pos SET status=? WHERE id=?',(v.status,po_id))
-            else:
-                c.execute("UPDATE pos SET status='dispatched' WHERE id=? AND status IN ('open','asn_booked')",(po_id,))
+            elif v.status=='delivered' and not c.execute("SELECT 1 FROM invoices WHERE po_id=? AND status='dispatched'",(po_id,)).fetchone():
+                c.execute("UPDATE pos SET status='delivered' WHERE id=?",(po_id,))
         if v.status=='uploaded':c.execute("UPDATE pos SET invoice_status='invoiced_up' WHERE id=?",(po_id,))
         if v.status=='paid':
             remaining=c.execute("SELECT COUNT(*) FROM invoices WHERE po_id=? AND status!='paid'",(po_id,)).fetchone()[0]
@@ -519,6 +541,7 @@ async def return_stock(invoice_id:int,request:Request):
         if quantity>delivered-returned: missing('Return exceeds delivered quantity')
         c.execute('UPDATE batches SET quantity=quantity+? WHERE id=?',(quantity,batch_id))
         c.execute("INSERT INTO movements(batch_id,invoice_id,quantity,type) VALUES(?,?,?,'return')",(batch_id,invoice_id,quantity))
+        c.execute("UPDATE pos SET status='open',archived=0 WHERE id=(SELECT po_id FROM invoices WHERE id=?) AND status IN ('delivered','gr_issued')",(invoice_id,))
     return {'ok':True}
 
 

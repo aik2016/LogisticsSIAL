@@ -239,17 +239,21 @@ def list_documents(po_id: int):
         return rows(c, 'SELECT id,po_id,filename,document_type,uploaded_at FROM po_documents WHERE po_id=? ORDER BY id DESC', (po_id,))
 
 
-@app.get('/api/documents/{document_id}')
 def document_access(c,document_id,request):
     row=c.execute('SELECT d.filename,d.stored_name,d.po_id FROM po_documents d WHERE d.id=?',(document_id,)).fetchone()
     if not row:fail('Document not found',404)
     u=request.state.user
+    if u['role']=='warehouse':
+        if not c.execute("SELECT 1 FROM tasks WHERE package_id=? AND assigned_to=? AND task_type='warehouse_dispatch'",(document_id,u['username'])).fetchone():
+            fail('Document access denied',403)
+        return row
     if not u['is_admin'] and 'pos_edit' not in u['permissions'].split(','):
         linked=c.execute('SELECT 1 FROM tasks WHERE po_id=? AND assigned_to=? LIMIT 1',(row['po_id'],u['username'])).fetchone()
         if not linked:fail('Document access denied',403)
     return row
 
 
+@app.get('/api/documents/{document_id}')
 def download_document(document_id: int,request:Request):
     with db() as c:
         row = document_access(c,document_id,request)
@@ -306,10 +310,10 @@ async def upload_related_document(request:Request,po_id:int,document_type:str=Fo
 def merge_invoice_package(po_id:int,request:Request):
     user=request.state.user
     with db() as c:
-        po=c.execute('SELECT id,kind FROM pos WHERE id=?',(po_id,)).fetchone()
+        po=c.execute('SELECT id,kind,asn_number,asn_link FROM pos WHERE id=?',(po_id,)).fetchone()
         if not po:fail('PO not found',404)
         task=c.execute("SELECT invoice_number FROM tasks WHERE po_id=? AND assigned_to=? AND task_type='asn_booking' ORDER BY id DESC LIMIT 1",(po_id,user['username'])).fetchone()
-        if not user['is_admin'] and not task and 'merge_pdfs' not in user['permissions'].split(','):fail('Merge permission required',403)
+        if not user['is_admin'] and 'merge_pdfs' not in user['permissions'].split(','):fail('Merge permission required',403)
         number=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po_id,)).fetchone()
         invoice=(number['number'] if number else task['invoice_number'] if task else '').strip()
         if not invoice or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}',invoice):fail('Assign an invoice number first')
@@ -318,8 +322,16 @@ def merge_invoice_package(po_id:int,request:Request):
         for doc in docs:by_type.setdefault(doc['document_type'],doc)
         if po['kind']=='marketplace':
             needed=['PO','Odoo Invoice','Nupco Invoice']
-            if 'ASN' in by_type:needed+=['ASN','Nupco Proforma']
-            if 'Delivery Note' in by_type:needed+=['Delivery Note']
+            booking=c.execute("SELECT asn_number,asn_link FROM tasks WHERE po_id=? AND task_type='asn_booking' ORDER BY id DESC LIMIT 1",(po_id,)).fetchone()
+            if 'ASN' in by_type or po['asn_number'] or po['asn_link'] or (booking and (booking['asn_number'] or booking['asn_link'])):
+                needed+=['ASN','Nupco Proforma']
+            quantities=c.execute('''SELECT
+                (SELECT SUM(quantity) FROM po_lines WHERE po_id=?) ordered,
+                (SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
+                 WHERE i.po_id=? AND i.status='booked' AND (i.number=? OR i.reference_number=?)) shipping''',(po_id,po_id,invoice,invoice)).fetchone()
+            if not quantities['shipping']:fail('Book invoice quantities and batches before merging the package')
+            if quantities['shipping']<quantities['ordered']:
+                needed+=['Delivery Note']
             order=['PO','ASN','Odoo Invoice','Nupco Proforma','Nupco Invoice','Delivery Note']
         else:
             needed=['PO','ASN','Odoo Invoice','Nupco Proforma']
@@ -979,7 +991,7 @@ def assign_asn_batch(v:ASNAssignmentBatch,request:Request):
 
 class ASNSubmission(BaseModel):
     asn_number:str=''
-    asn_date:date
+    asn_date:date|None=None
     asn_link:str=''
     planned_delivery_date:date
     remarks:str=''
@@ -987,14 +999,18 @@ class ASNSubmission(BaseModel):
 
 @app.post('/api/asn-assignments/{task_id}/submit')
 def submit_asn(task_id:int,v:ASNSubmission,request:Request):
-    if not v.asn_number.strip() and not v.asn_link.strip():fail('ASN number or link required')
     with db() as c:
         task=c.execute("SELECT * FROM tasks WHERE id=? AND task_type='asn_booking'",(task_id,)).fetchone()
         if not task:fail('ASN task not found',404)
         if task['assigned_to']!=request.state.user['username'] and not request.state.user['is_admin']:fail('This task belongs to another user',403)
         if task['status'] not in ('open','in_progress','returned'):fail('Task cannot be submitted from this state')
+        po=c.execute('SELECT kind,address,address_ar FROM pos WHERE id=?',(task['po_id'],)).fetchone()
+        requires_asn=po['kind']!='marketplace' or any(term in ((po['address'] or '')+' '+(po['address_ar'] or '')).lower() for term in ('nupco','نوبكو'))
+        if requires_asn or v.asn_number or v.asn_date or v.asn_link:
+            if not v.asn_number.strip() or not v.asn_date or not re.fullmatch(r'https?://[^\s]+',v.asn_link.strip(),re.I):
+                fail('Enter ASN ID, booking date and a valid ASN link')
         c.execute("UPDATE tasks SET status='submitted',asn_number=?,asn_date=?,asn_link=?,planned_delivery_date=?,asn_remarks=?,submitted_at=CURRENT_TIMESTAMP WHERE id=?",
-                  (v.asn_number.strip(),v.asn_date.isoformat(),v.asn_link.strip(),v.planned_delivery_date.isoformat(),v.remarks.strip(),task_id))
+                  (v.asn_number.strip(),v.asn_date.isoformat() if v.asn_date else '',v.asn_link.strip(),v.planned_delivery_date.isoformat(),v.remarks.strip(),task_id))
         c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'submit_asn',str(task_id)))
     return {'ok':True,'status':'submitted'}
 
@@ -1017,14 +1033,14 @@ def review_asn(task_id:int,v:ASNReview,request:Request):
             po=c.execute('SELECT kind FROM pos WHERE id=?',(task['po_id'],)).fetchone()
             types={r['document_type'] for r in rows(c,'SELECT document_type FROM po_documents WHERE po_id=?',(task['po_id'],))}
             needed={'PO','ASN','Odoo Invoice','Nupco Proforma'} if po['kind']!='marketplace' else {'PO','Odoo Invoice','Nupco Invoice'}
-            if po['kind']=='marketplace' and 'ASN' in types:needed.add('Nupco Proforma')
+            if po['kind']=='marketplace' and (task['asn_number'] or 'ASN' in types):needed.update(('ASN','Nupco Proforma'))
             if not needed.issubset(types):fail('Missing required documents: '+', '.join(sorted(needed-types)))
-            if 'Merged Invoice' not in types:fail('Merge the invoice PDF package before approval')
+            if not c.execute("SELECT 1 FROM po_documents WHERE po_id=? AND filename=? AND document_type='Merged Invoice'",(task['po_id'],task['invoice_number']+'.pdf')).fetchone():fail('Merge the invoice PDF package before approval')
             c.execute("UPDATE tasks SET status='done',reviewed_at=CURRENT_TIMESTAMP WHERE id=?",(task_id,))
             c.execute('UPDATE pos SET status=?,asn_number=?,asn_date=?,asn_link=? WHERE id=?',
-                      ('asn_booked',task['asn_number'],task['asn_date'],task['asn_link'],task['po_id']))
+                      ('asn_booked' if task['asn_number'] else 'open',task['asn_number'],task['asn_date'],task['asn_link'],task['po_id']))
             c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',
-                      (task['po_id'],'asn_booked',task['asn_remarks'],request.state.user['id']))
+                      (task['po_id'],'asn_booked' if task['asn_number'] else 'open',task['asn_remarks'],request.state.user['id']))
         else:
             c.execute("UPDATE tasks SET status='returned',details=details || CHAR(10) || ? ,reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
                       ('Returned: '+v.reason.strip(),task_id))
@@ -1052,7 +1068,7 @@ def assign_warehouse(v:WarehouseAssignment,request:Request):
     ids=list(dict.fromkeys(v.po_ids))
     if not ids or len(ids)>100:fail('Select 1 to 100 POs')
     with db() as c:
-        target=c.execute('SELECT id,username FROM users WHERE username=? AND active=1',(v.assigned_to.strip(),)).fetchone()
+        target=c.execute("SELECT id,username FROM users WHERE username=? AND active=1 AND role='warehouse'",(v.assigned_to.strip(),)).fetchone()
         if not target:fail('Select an active user')
         output=[]
         for po_id in ids:
@@ -1065,10 +1081,17 @@ def assign_warehouse(v:WarehouseAssignment,request:Request):
             assigned=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po_id,)).fetchone()
             source=c.execute('SELECT invoice_reference FROM regional_po_rows WHERE po_number=? ORDER BY id DESC LIMIT 1',(po['number'],)).fetchone()
             invoice=assigned['number'] if assigned else (source['invoice_reference'] if source else '')
+            package=c.execute("SELECT id FROM po_documents WHERE po_id=? AND filename=? AND document_type='Merged Invoice' ORDER BY id DESC LIMIT 1",(po_id,invoice+'.pdf')).fetchone()
+            if not c.execute("SELECT 1 FROM invoices i JOIN invoice_lines il ON il.invoice_id=i.id WHERE i.po_id=? AND (i.number=? OR i.reference_number=?) AND i.status='booked'", (po_id,invoice,invoice)).fetchone():
+                fail(f"{po['number']}: book invoice quantities and batches before assignment")
+            if not package:fail(f"{po['number']}: merge the invoice package before assignment")
+            if not c.execute("SELECT 1 FROM tasks WHERE po_id=? AND invoice_number=? AND task_type='asn_booking' AND status='done'",(po_id,invoice)).fetchone():
+                fail(f"{po['number']}: complete booking review before assignment")
             details=f"PO {po['number']} · Invoice {invoice or 'Not entered'} · ASN {po['asn_number'] or 'Not required'} · {po['address'] or 'Address not entered'}"
             task_id=c.execute('''INSERT INTO tasks(title,assigned_to,po_id,due_date,status,details,created_by,task_type,invoice_number,asn_number,asn_date,asn_link)
               VALUES(?,?,?,?,'open',?,?,'warehouse_dispatch',?,?,?,?)''',
               ('Prepare and dispatch',target['username'],po_id,v.due_date.isoformat(),details,request.state.user['id'],invoice,po['asn_number'],po['asn_date'],po['asn_link'])).lastrowid
+            c.execute('UPDATE tasks SET package_id=? WHERE id=?',(package['id'],task_id))
             output.append({'task_id':task_id,'po_number':po['number']})
     return {'assignments':output}
 
@@ -1079,8 +1102,11 @@ def list_warehouse_assignments(request:Request):
         query="SELECT t.*,p.number po_number,p.kind,p.status po_status,p.address,p.address_ar,p.region FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.task_type='warehouse_dispatch'"
         records=rows(c,query+' ORDER BY t.id DESC') if request.state.user['is_admin'] else rows(c,query+' AND t.assigned_to=? ORDER BY t.id DESC',(request.state.user['username'],))
         for task in records:
-            task['items']=rows(c,'''SELECT l.item_code,l.quantity,l.due_date,b.batch_no,il.quantity booked_qty FROM po_lines l
-              LEFT JOIN invoice_lines il ON il.po_line_id=l.id LEFT JOIN batches b ON b.id=il.batch_id WHERE l.po_id=? ORDER BY l.line_no''',(task['po_id'],))
+            task['items']=rows(c,'''SELECT l.item_code,il.quantity booked_qty,b.batch_no
+                FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
+                JOIN po_lines l ON l.id=il.po_line_id JOIN batches b ON b.id=il.batch_id
+                WHERE i.po_id=? AND (i.number=? OR i.reference_number=?) ORDER BY l.line_no''',
+                (task['po_id'],task['invoice_number'],task['invoice_number']))
         return records
 
 
@@ -1100,6 +1126,8 @@ def warehouse_status(task_id:int,v:WarehouseUpdate,request:Request):
         if task['status'] not in ('open','in_progress'):fail('Assignment is already closed')
         if task['kind']!='marketplace' and task['po_status']!='asn_booked':fail('Tender PO requires booked ASN')
         if task['po_status'] not in ('open','asn_booked'):fail('PO cannot be dispatched from its current status')
+        if v.status=='dispatched':
+            c.execute("UPDATE invoices SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE po_id=? AND status='booked' AND (number=? OR reference_number=?)",(task['po_id'],task['invoice_number'],task['invoice_number']))
         c.execute('UPDATE pos SET status=? WHERE id=?',(v.status,task['po_id']))
         c.execute('UPDATE tasks SET status=?,details=details || CHAR(10) || ? WHERE id=?',('done' if v.status=='dispatched' else 'cancelled',v.reason,task_id))
         c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(task['po_id'],v.status,v.reason,request.state.user['id']))
@@ -1154,3 +1182,17 @@ async def soft_copy_attach(files:list[UploadFile]=File(...),fingerprints:str=For
         for name in written:(DOCS / name).unlink(missing_ok=True)
         raise
     return {'documents_added':len(written),'duplicates_skipped':len(prepared)-len(written),'backup_id':backup_id}
+
+
+@app.post('/api/tasks/{task_id}/reassign')
+def reassign_task(task_id:int, payload:dict, request:Request):
+    if not request.state.user['is_admin']:fail('Admin only',403)
+    assignee=str(payload.get('assigned_to','')).strip()
+    with db() as c:
+        task=c.execute("SELECT task_type,status FROM tasks WHERE id=?",(task_id,)).fetchone()
+        user=c.execute("SELECT role FROM users WHERE username=? AND active=1",(assignee,)).fetchone()
+        if not task or task['status'] not in ('open','in_progress','returned','submitted'):fail('Select unfinished work')
+        if not user or (user['role']=='warehouse')!=(task['task_type']=='warehouse_dispatch'):fail('Select an active user with the appropriate role')
+        c.execute("UPDATE tasks SET assigned_to=? WHERE id=?",(assignee,task_id))
+        c.execute("INSERT INTO audit(user_id,action,target) VALUES(?,?,?)",(request.state.user['id'],'reassign_task',str(task_id)))
+    return {'ok':True}

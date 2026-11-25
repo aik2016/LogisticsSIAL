@@ -25,7 +25,7 @@ with db() as c:
         c.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
     if 'role' not in [r['name'] for r in c.execute('PRAGMA table_info(users)')]:
         c.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'staff'")
-        c.execute("UPDATE users SET role='warehouse',permissions='' WHERE LOWER(username) LIKE '%warehouse%'")
+        c.execute("UPDATE users SET role='warehouse',permissions='' WHERE LOWER(username) LIKE '%warehouse%' AND is_admin=0")
 
 
 def hash_password(password, salt=None):
@@ -149,6 +149,7 @@ def users():
 
 @app.post('/api/auth/users')
 def create_user(v:UserCreate,request:Request):
+    if v.is_admin and v.role=='warehouse':raise HTTPException(400,'Admin accounts cannot use the warehouse role')
     if v.role not in ('staff','warehouse','accountant'):raise HTTPException(400,'Unknown role')
     if any(p not in PERMISSIONS for p in v.permissions):raise HTTPException(400,'Unknown permission')
     try: password_hash=hash_password(v.password)
@@ -180,7 +181,8 @@ def update_user(user_id:int,v:UserUpdate,request:Request):
         owner=c.execute("SELECT id FROM users WHERE username='admin' AND is_admin=1").fetchone()
         if owner and user_id==owner['id'] and request.state.user['id']!=owner['id']:raise HTTPException(403,'Primary admin account is protected')
         if target['is_admin'] and not request.state.user['is_admin']:raise HTTPException(403,'Only an admin can change an admin account')
-        if target['is_admin'] and user_id==owner['id'] and (v.active is False or v.permissions is not None):raise HTTPException(400,'Primary admin account cannot be deactivated or restricted')
+        if owner and user_id==owner['id'] and (v.active is False or v.permissions is not None or v.role is not None):raise HTTPException(400,'Primary admin account cannot be deactivated or restricted')
+        if v.role=='warehouse' and target['is_admin']:raise HTTPException(400,'Admin accounts cannot use the warehouse role')
         if v.role is not None:
             if v.role not in ('staff','warehouse','accountant'):raise HTTPException(400,'Unknown role')
             c.execute('UPDATE users SET role=? WHERE id=?',(v.role,user_id))

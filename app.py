@@ -196,7 +196,7 @@ class Task(BaseModel):
 
 @app.get('/')
 def home():
-    return FileResponse(ROOT / 'static' / 'index.html')
+    return FileResponse(ROOT / 'static' / 'index.html', headers={'Cache-Control': 'no-store, must-revalidate'})
 
 
 def dashboard_data():

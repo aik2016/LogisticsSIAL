@@ -154,7 +154,7 @@ def create_user(v:UserCreate,request:Request):
     try: password_hash=hash_password(v.password)
     except ValueError as e:raise HTTPException(400,str(e))
     with db() as c:
-        owner=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1').fetchone()
+        owner=c.execute("SELECT id FROM users WHERE username='admin' AND is_admin=1").fetchone()
         if v.is_admin and (not request.state.user['is_admin'] or not owner or request.state.user['id']!=owner['id']):raise HTTPException(403,'Only the primary admin can create assistant admins')
         try: uid=c.execute('INSERT INTO users(username,email,password_hash,is_admin,permissions,role) VALUES(?,?,?,?,?,?)',(v.username.strip(),v.email.strip().lower(),password_hash,int(v.is_admin),'' if v.role=='warehouse' else ','.join(sorted(set(v.permissions))),v.role)).lastrowid
         except sqlite3.IntegrityError:raise HTTPException(409,'Username already exists')
@@ -177,7 +177,7 @@ def update_user(user_id:int,v:UserUpdate,request:Request):
     with db() as c:
         target=c.execute('SELECT * FROM users WHERE id=?',(user_id,)).fetchone()
         if not target:raise HTTPException(404,'User not found')
-        owner=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1').fetchone()
+        owner=c.execute("SELECT id FROM users WHERE username='admin' AND is_admin=1").fetchone()
         if owner and user_id==owner['id'] and request.state.user['id']!=owner['id']:raise HTTPException(403,'Primary admin account is protected')
         if target['is_admin'] and not request.state.user['is_admin']:raise HTTPException(403,'Only an admin can change an admin account')
         if target['is_admin'] and user_id==owner['id'] and (v.active is False or v.permissions is not None):raise HTTPException(400,'Primary admin account cannot be deactivated or restricted')

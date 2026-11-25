@@ -253,7 +253,7 @@ class Task(BaseModel):
     details: str = ''
 
 
-RELEASE='20261125-10'
+RELEASE='20261125-11'
 
 @app.get('/release')
 def release():

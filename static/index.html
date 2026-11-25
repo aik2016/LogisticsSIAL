@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sial Logistics Control</title><link rel="stylesheet" href="/static/app.css?v=20261125-10"></head>
-<body><button id="release-notice" hidden type="button" onclick="location.reload()">Update available · Reload</button><div id="app"></div><footer class="release-info">Release 20261125-10</footer><div id="toast" role="status" aria-live="polite"></div><script src="/static/app.js?v=20261125-10" defer></script><script>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sial Logistics Control</title><link rel="stylesheet" href="/static/app.css?v=20261125-11"></head>
+<body><button id="release-notice" hidden type="button" onclick="location.reload()">Update available · Reload</button><div id="app"></div><footer class="release-info">Release 20261125-11</footer><div id="toast" role="status" aria-live="polite"></div><script src="/static/app.js?v=20261125-11" defer></script><script>
 const checkRelease = async () => {
   try {
     const response = await fetch('/release', {cache: 'no-store'});
-    if (response.ok && (await response.text()).trim() !== '20261125-10') {
+    if (response.ok && (await response.text()).trim() !== '20261125-11') {
       document.getElementById('release-notice').hidden = false;
     }
   } catch (_) {}

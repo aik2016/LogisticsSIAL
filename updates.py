@@ -82,6 +82,26 @@ def relink_documents(c):
     return linked
 
 
+@app.post('/api/admin/enrich-po-pdfs')
+def enrich_po_pdfs(request:Request,after_id:int=0,limit:int=20):
+    primary_admin(request)
+    if not 1<=limit<=25:fail('Limit must be 1 to 25')
+    from pdf_extract import extract
+    with db() as c:
+        documents=rows(c,"SELECT d.id,d.po_id,d.stored_name FROM po_documents d WHERE d.id>? AND d.document_type='PO' ORDER BY d.id LIMIT ?",(after_id,limit))
+    updated=0;errors=[]
+    for doc in documents:
+        path=DOCS/doc['stored_name']
+        if not path.is_file():errors.append(doc['id']);continue
+        try:result=extract(path.read_bytes())
+        except Exception:errors.append(doc['id']);continue
+        with db() as c:
+            c.execute("UPDATE pos SET po_created_at=CASE WHEN po_created_at='' THEN ? ELSE po_created_at END,address_ar=CASE WHEN address_ar='' THEN ? ELSE address_ar END WHERE id=?",
+                      (result.get('created_at') or '',result.get('address_ar') or '',doc['po_id']))
+        updated+=1
+    return {'next_id':documents[-1]['id'] if documents else after_id,'done':len(documents)<limit,'processed':len(documents),'updated':updated,'error_ids':errors}
+
+
 def primary_admin(request):
     if not request.state.user['is_admin']:fail('Primary admin only',403)
     with db() as c:
@@ -386,7 +406,7 @@ async def bulk_approve(request: Request, files: list[UploadFile] = File(...), fi
                         c.execute('INSERT INTO items(code,pcs_per_box,boxes_per_pallet) VALUES(?,?,?) ON CONFLICT(code) DO NOTHING', (code,pack,pallet_size(code)))
                         c.execute('INSERT INTO po_lines(po_id,line_no,item_code,quantity,due_date,address) VALUES(?,?,?,?,?,?)', (po_id,line_no,code,quantity,due,address))
                     c.execute("UPDATE pos SET address=COALESCE(NULLIF(address,''),?) WHERE id=?", (extracted[0][4],po_id))
-                c.execute("UPDATE pos SET customer=CASE WHEN customer='' THEN ? ELSE customer END,customer_po=CASE WHEN kind='marketplace' AND customer_po='' THEN ? ELSE customer_po END,value=CASE WHEN value IS NULL OR value=0 THEN ? ELSE value END,added_from_pdf=1,po_created_at=CASE WHEN po_created_at='' THEN ? ELSE po_created_at END,address_ar=CASE WHEN address_ar='' THEN ? ELSE address_ar END,region=CASE WHEN region='' THEN ? ELSE region END WHERE id=?",
+                c.execute("UPDATE pos SET customer=CASE WHEN customer='' THEN ? ELSE customer END,customer_po=CASE WHEN kind='marketplace' AND customer_po='' THEN ? ELSE customer_po END,value=CASE WHEN value IS NULL OR value=0 THEN ? ELSE value END,added_from_pdf=1,po_created_at=CASE WHEN po_created_at='' THEN ? ELSE po_created_at END,address_ar=CASE WHEN address_ar='' THEN ? ELSE address_ar END,region=CASE WHEN region='' THEN ? ELSE region END,invoice_status=CASE WHEN invoice_status='rcv_needed' THEN '' ELSE invoice_status END WHERE id=?",
                           (profile['customer'],profile['customer_po'],profile['value'] or 0,profile.get('created_at') or '',profile.get('address_ar') or '',region_from_address(profile['items'][0].get('address','')),po_id))
                 for filename,content,_ in files_for_po:
                     name = stored_file(c,po_id,filename,content)
@@ -829,7 +849,7 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
             for number,regions in mapping.items():
                 region=next(iter(regions))
                 c.execute('INSERT INTO pos(number,kind,region) VALUES(?,?,?) ON CONFLICT(number) DO NOTHING',(number,'marketplace' if number.startswith('300') else 'tender',region))
-                c.execute('UPDATE pos SET region=? WHERE number=?',(region,number))
+                c.execute("UPDATE pos SET region=?,invoice_status=CASE WHEN invoice_status='rcv_needed' THEN '' ELSE invoice_status END WHERE number=?",(region,number))
                 pid=c.execute('SELECT id FROM pos WHERE number=?',(number,)).fetchone()['id']
                 if not c.execute('SELECT 1 FROM po_lines WHERE po_id=?',(pid,)).fetchone():
                     for n,r in enumerate((x for x in records if x['po']==number),1):

@@ -81,6 +81,7 @@ def init_db():
         c.execute("UPDATE items SET boxes_per_pallet=14 WHERE boxes_per_pallet=0 AND code LIKE 'RIMZP-%'")
         c.execute("UPDATE items SET boxes_per_pallet=9 WHERE boxes_per_pallet=0 AND (code LIKE 'RIM-%' OR code LIKE 'RIB-%')")
         c.execute("UPDATE items SET boxes_per_pallet=12 WHERE boxes_per_pallet=0 AND code LIKE 'CTND-%'")
+        c.execute("UPDATE pos SET invoice_status='' WHERE invoice_status='rcv_needed' AND status='open' AND NOT EXISTS (SELECT 1 FROM invoices WHERE invoices.po_id=pos.id)")
 
 
 init_db()

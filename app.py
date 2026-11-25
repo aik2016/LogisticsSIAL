@@ -80,6 +80,8 @@ def init_db():
                 c.execute(f'ALTER TABLE tasks ADD COLUMN {column} {definition}')
         if 'package_id' not in [r['name'] for r in c.execute('PRAGMA table_info(tasks)')]:
             c.execute('ALTER TABLE tasks ADD COLUMN package_id INTEGER')
+        if 'shipment_invoice_id' not in [r['name'] for r in c.execute('PRAGMA table_info(tasks)')]:
+            c.execute('ALTER TABLE tasks ADD COLUMN shipment_invoice_id INTEGER')
         # Apply family defaults only to items whose pallet size is still unknown.
         c.execute("UPDATE items SET boxes_per_pallet=14 WHERE boxes_per_pallet=0 AND code LIKE 'RIMZP-%'")
         c.execute("UPDATE items SET boxes_per_pallet=9 WHERE boxes_per_pallet=0 AND (code LIKE 'RIM-%' OR code LIKE 'RIB-%')")

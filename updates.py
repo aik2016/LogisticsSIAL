@@ -1083,8 +1083,10 @@ def assign_warehouse(v:WarehouseAssignment,request:Request):
             source=c.execute('SELECT invoice_reference FROM regional_po_rows WHERE po_number=? ORDER BY id DESC LIMIT 1',(po['number'],)).fetchone()
             invoice=assigned['number'] if assigned else (source['invoice_reference'] if source else '')
             package=c.execute("SELECT package_id id FROM tasks WHERE po_id=? AND invoice_number=? AND task_type='asn_booking' AND status='done' AND package_id IS NOT NULL ORDER BY id DESC LIMIT 1",(po_id,invoice)).fetchone()
-            if not c.execute("SELECT 1 FROM invoices i JOIN invoice_lines il ON il.invoice_id=i.id WHERE i.po_id=? AND (i.number=? OR i.reference_number=?) AND i.status='booked'", (po_id,invoice,invoice)).fetchone():
-                fail(f"{po['number']}: book invoice quantities and batches before assignment")
+            shipments=rows(c,"""SELECT DISTINCT i.id FROM invoices i JOIN invoice_lines il ON il.invoice_id=i.id
+                WHERE i.po_id=? AND (i.number=? OR i.reference_number=?) AND i.status='booked' LIMIT 2""",
+                (po_id,invoice,invoice))
+            if len(shipments)!=1:fail(f"{po['number']}: one booked shipment with batch quantities is required")
             if not package:fail(f"{po['number']}: merge the invoice package before assignment")
             if not c.execute("SELECT 1 FROM tasks WHERE po_id=? AND invoice_number=? AND task_type='asn_booking' AND status='done'",(po_id,invoice)).fetchone():
                 fail(f"{po['number']}: complete booking review before assignment")
@@ -1092,7 +1094,7 @@ def assign_warehouse(v:WarehouseAssignment,request:Request):
             task_id=c.execute('''INSERT INTO tasks(title,assigned_to,po_id,due_date,status,details,created_by,task_type,invoice_number,asn_number,asn_date,asn_link)
               VALUES(?,?,?,?,'open',?,?,'warehouse_dispatch',?,?,?,?)''',
               ('Prepare and dispatch',target['username'],po_id,v.due_date.isoformat(),details,request.state.user['id'],invoice,po['asn_number'],po['asn_date'],po['asn_link'])).lastrowid
-            c.execute('UPDATE tasks SET package_id=? WHERE id=?',(package['id'],task_id))
+            c.execute('UPDATE tasks SET package_id=?,shipment_invoice_id=? WHERE id=?',(package['id'],shipments[0]['id'],task_id))
             output.append({'task_id':task_id,'po_number':po['number']})
     return {'assignments':output}
 
@@ -1106,8 +1108,7 @@ def list_warehouse_assignments(request:Request):
             task['items']=rows(c,'''SELECT l.item_code,il.quantity booked_qty,b.batch_no
                 FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
                 JOIN po_lines l ON l.id=il.po_line_id JOIN batches b ON b.id=il.batch_id
-                WHERE i.po_id=? AND (i.number=? OR i.reference_number=?) ORDER BY l.line_no''',
-                (task['po_id'],task['invoice_number'],task['invoice_number']))
+                WHERE i.id=? ORDER BY l.line_no''', (task['shipment_invoice_id'],))
         return records
 
 
@@ -1128,7 +1129,7 @@ def warehouse_status(task_id:int,v:WarehouseUpdate,request:Request):
         if task['kind']!='marketplace' and task['po_status']!='asn_booked':fail('Tender PO requires booked ASN')
         if task['po_status'] not in ('open','asn_booked'):fail('PO cannot be dispatched from its current status')
         if v.status=='dispatched':
-            c.execute("UPDATE invoices SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE po_id=? AND status='booked' AND (number=? OR reference_number=?)",(task['po_id'],task['invoice_number'],task['invoice_number']))
+            c.execute("UPDATE invoices SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status='booked'",(task['shipment_invoice_id'],))
         c.execute('UPDATE pos SET status=? WHERE id=?',(v.status,task['po_id']))
         c.execute('UPDATE tasks SET status=?,details=details || CHAR(10) || ? WHERE id=?',('done' if v.status=='dispatched' else 'cancelled',v.reason,task_id))
         c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(task['po_id'],v.status,v.reason,request.state.user['id']))

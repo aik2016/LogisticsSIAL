@@ -29,6 +29,14 @@ def extract(content):
     po_match=PO.search(text)
     first_page=text.split('\f')[0]
     header=first_page.splitlines()
+    created_at=''
+    for n,line in enumerate(header):
+        if 'Date (Gregorian)' in line:
+            match=re.search(r'\b(\d{2}/\d{2}/\d{4})\b',' '.join(header[n:n+4]))
+            if match:
+                from datetime import datetime
+                created_at=datetime.strptime(match.group(1),'%d/%m/%Y').date().isoformat()
+            break
     value=None
     for n,line in enumerate(header):
         if 'PO Value' in line:
@@ -63,6 +71,7 @@ def extract(content):
         qty_raw=near(lines,'Required Quantity',re.compile(r'\b[\d,]+\.\d{3}\b'))
         address_line=next((x.strip() for x in lines if x.strip().startswith('Plant:')),None)
         address=address_line[6:].strip() if address_line else ''
+        address=re.split(r'[\u0600-\u06ff]',address,1)[0].strip()
         if not address and customer:address=customer
         item_number=''
         for n,line in enumerate(lines):
@@ -80,7 +89,12 @@ def extract(content):
         if code:
             items.append({'page':page_no,'line_no':item_number,'item_code':code,'quantity':int(float(qty_raw.replace(',',''))) if qty_raw else None,
                           'schedules':schedule,'address':address})
-    return {'po_number':po_match.group(0) if po_match else None,'customer_po':customer_po,'customer':customer,'value':value,'items':items,
+    arabic_address=''
+    for line in text.splitlines():
+        if line.strip().startswith('Plant:'):
+            match=re.search(r'[\u0600-\u06ff].*',line)
+            if match:arabic_address=match.group(0).strip();break
+    return {'po_number':po_match.group(0) if po_match else None,'customer_po':customer_po if po_match and po_match.group(0).startswith('300') else '', 'customer':customer,'value':value,'created_at':created_at,'address_ar':arabic_address,'items':items,
             'warnings':(["PO number not found"] if not po_match else [])+(["No item lines found"] if not items else [])+
                        [f"Item on page {i['page']}: due date not found" for i in items if not i['schedules']]+
                        [f"Item on page {i['page']}: schedule total differs from required quantity" for i in items if i['quantity'] is not None and i['schedules'] and sum(x['quantity'] for x in i['schedules'])!=i['quantity']]}

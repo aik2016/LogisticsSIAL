@@ -58,10 +58,13 @@ def init_db():
         CREATE TABLE IF NOT EXISTS po_remaining_snapshot (po_id INTEGER NOT NULL REFERENCES pos(id), item_code TEXT NOT NULL, remaining_qty INTEGER NOT NULL CHECK(remaining_qty>=0), source_name TEXT NOT NULL, PRIMARY KEY(po_id,item_code));
         CREATE TABLE IF NOT EXISTS regional_po_rows (id INTEGER PRIMARY KEY, source_name TEXT NOT NULL, sheet TEXT NOT NULL, row_number INTEGER NOT NULL, po_number TEXT NOT NULL, region TEXT NOT NULL, status TEXT DEFAULT '', invoice_reference TEXT DEFAULT '', asn_number TEXT DEFAULT '', asn_date TEXT DEFAULT '', item_text TEXT DEFAULT '', planned_qty TEXT DEFAULT '', left_qty TEXT DEFAULT '', due_date TEXT DEFAULT '', address TEXT DEFAULT '', customer_po TEXT DEFAULT '', UNIQUE(source_name,sheet,row_number));
         CREATE TABLE IF NOT EXISTS po_invoice_numbers (po_id INTEGER PRIMARY KEY REFERENCES pos(id), number TEXT NOT NULL UNIQUE, assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, assigned_by INTEGER);
+        CREATE TABLE IF NOT EXISTS po_document_relinks (po_number TEXT NOT NULL,filename TEXT NOT NULL,stored_name TEXT NOT NULL UNIQUE,sha256 TEXT DEFAULT '',document_type TEXT DEFAULT 'PO',uploaded_at TEXT DEFAULT '');
         ''')
         if 'address' not in [r['name'] for r in c.execute('PRAGMA table_info(po_lines)')]:
             c.execute("ALTER TABLE po_lines ADD COLUMN address TEXT DEFAULT ''")
-        for column,definition in [('invoice_status',"TEXT DEFAULT 'rcv_needed'"),('marketplace_status',"TEXT DEFAULT ''"),('marketplace_reason',"TEXT DEFAULT ''"),('archived',"INTEGER DEFAULT 0"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''")]:
+        if 'cancelled_qty' not in [r['name'] for r in c.execute('PRAGMA table_info(po_lines)')]:
+            c.execute('ALTER TABLE po_lines ADD COLUMN cancelled_qty INTEGER DEFAULT 0')
+        for column,definition in [('invoice_status',"TEXT DEFAULT ''"),('marketplace_status',"TEXT DEFAULT ''"),('marketplace_reason',"TEXT DEFAULT ''"),('archived',"INTEGER DEFAULT 0"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''"),('created_at',"TEXT DEFAULT ''"),('po_created_at',"TEXT DEFAULT ''"),('address_ar',"TEXT DEFAULT ''"),('added_from_pdf',"INTEGER DEFAULT 0"),('paid_amount',"REAL DEFAULT 0"),('payment_reason',"TEXT DEFAULT ''")]:
             if column not in [r['name'] for r in c.execute('PRAGMA table_info(pos)')]:
                 c.execute(f'ALTER TABLE pos ADD COLUMN {column} {definition}')
         if 'reference_number' not in [r['name'] for r in c.execute('PRAGMA table_info(invoices)')]:
@@ -71,7 +74,7 @@ def init_db():
             c.execute("ALTER TABLE po_documents ADD COLUMN sha256 TEXT DEFAULT ''")
         if 'document_type' not in [r['name'] for r in c.execute('PRAGMA table_info(po_documents)')]:
             c.execute("ALTER TABLE po_documents ADD COLUMN document_type TEXT DEFAULT 'PO'")
-        for column,definition in [('created_by','INTEGER'),('task_type',"TEXT DEFAULT ''"),('invoice_number',"TEXT DEFAULT ''"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''"),('asn_remarks',"TEXT DEFAULT ''"),('submitted_at','TEXT'),('reviewed_at','TEXT')]:
+        for column,definition in [('created_by','INTEGER'),('task_type',"TEXT DEFAULT ''"),('invoice_number',"TEXT DEFAULT ''"),('asn_number',"TEXT DEFAULT ''"),('asn_date',"TEXT DEFAULT ''"),('asn_link',"TEXT DEFAULT ''"),('asn_remarks',"TEXT DEFAULT ''"),('planned_delivery_date',"TEXT DEFAULT ''"),('submitted_at','TEXT'),('reviewed_at','TEXT')]:
             if column not in [r['name'] for r in c.execute('PRAGMA table_info(tasks)')]:
                 c.execute(f'ALTER TABLE tasks ADD COLUMN {column} {definition}')
         # Apply family defaults only to items whose pallet size is still unknown.
@@ -103,9 +106,9 @@ def outstanding_by_line(c, lines):
             for line in sorted(group,key=lambda x:(x['due_date'],x['id']),reverse=True):
                 base=min(line['quantity'],remaining)
                 remaining-=base
-                result[line['id']]=max(0,base-(line.get('delivered_qty') or 0))
+                result[line['id']]=max(0,base-(line.get('delivered_qty') or 0)-(line.get('cancelled_qty') or 0))
         else:
-            for line in group:result[line['id']]=max(0,line['quantity']-(line.get('delivered_qty') or 0))
+            for line in group:result[line['id']]=max(0,line['quantity']-(line.get('delivered_qty') or 0)-(line.get('cancelled_qty') or 0))
     return result
 
 
@@ -198,7 +201,7 @@ def home():
 def dashboard_data():
     today = business_today()
     with db() as c:
-        pos = rows(c, '''SELECT p.*, MIN(l.due_date) due_date, SUM(l.quantity) ordered_qty,
+        pos = rows(c, '''SELECT p.*, MIN(l.due_date) due_date, SUM(l.quantity) ordered_qty,SUM(COALESCE(l.cancelled_qty,0)) cancelled_qty,
           (SELECT ss.status FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_status,
           (SELECT ss.invoice_status FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_invoice_status,
           (SELECT ss.remaining_detail FROM source_status ss WHERE ss.po_number=p.number ORDER BY ss.id DESC LIMIT 1) source_remaining,
@@ -225,9 +228,11 @@ def dashboard_data():
         region_rows=rows(c,'''SELECT r.* FROM regional_po_rows r WHERE r.source_name=
           (SELECT source_name FROM regional_po_rows ORDER BY id DESC LIMIT 1) ORDER BY po_number,row_number''')
         regional_pos={r['po_number'] for r in region_rows}
-        for p in pos:p['is_outstanding']=p['number'] in regional_pos if region_rows else False
+        for p in pos:
+            p['is_outstanding']=(p['number'] in regional_pos or bool(p['added_from_pdf'])) and not p['archived'] and p['status'] not in ('dispatched','delivered','gr_issued')
+            p['is_ngh']=p['number'].startswith('300') and 'nupco' not in (p['address'] or '').lower() and 'nupco' not in (p['address_ar'] or '').lower() and any(term in ((p['address'] or '')+' '+(p['customer'] or '')).lower() for term in ('ngh','national guard','mngha'))
         due_lines = rows(c, '''SELECT p.id po_id,p.number,p.customer,p.customer_po,p.region,p.value,p.status,p.overdue_reason,
-           l.id,l.line_no,l.item_code,l.quantity,l.quantity ordered_qty,l.due_date,
+           l.id,l.line_no,l.item_code,l.quantity,l.quantity ordered_qty,l.cancelled_qty,l.due_date,
            COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
            FROM po_lines l JOIN pos p ON p.id=l.po_id''')
         remaining=outstanding_by_line(c,due_lines)
@@ -247,6 +252,8 @@ def dashboard_data():
         for p in pos:
             if c.execute('SELECT 1 FROM po_remaining_snapshot WHERE po_id=? LIMIT 1',(p['id'],)).fetchone():
                 p['delivered_qty']=max(0,(p['ordered_qty'] or 0)-po_remaining.get(p['id'],0))
+            p['remaining_qty']=po_remaining.get(p['id'],0)
+            p['is_outstanding']=bool(p['remaining_qty']>0 and (p['number'] in regional_pos or p['added_from_pdf']) and not p['archived'] and p['status']!='dispatched')
             p['urgent']=any(x['po_id']==p['id'] for x in urgent)
             p['reminder']=any(x['po_id']==p['id'] for x in reminders)
         if region_rows:
@@ -270,7 +277,8 @@ def dashboard_data():
             for p in pos:
                 p['urgent']=any(x['po_id']==p['id'] for x in urgent)
                 p['reminder']=any(x['po_id']==p['id'] for x in reminders)
-        return {'pos':pos,'stock':stock,'batches':rows(c,'SELECT * FROM batches ORDER BY id DESC'), 'invoices':invoices,
+        batch_rows=rows(c,'''SELECT b.*,b.quantity-COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id WHERE il.batch_id=b.id AND i.status IN ('booked','dispatched')),0) free_quantity FROM batches b ORDER BY b.id DESC''')
+        return {'pos':pos,'stock':stock,'batches':batch_rows, 'invoices':invoices,
                 'issues':rows(c,'SELECT * FROM issues ORDER BY id DESC'), 'tasks':rows(c,'SELECT * FROM tasks ORDER BY id DESC'),
                 'lines':rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date'),
                 'reminders':reminders, 'urgent':urgent,
@@ -284,11 +292,22 @@ def dashboard_data():
 def dashboard(request:Request):
     data=dashboard_data()
     user=request.state.user
+    if user.get('role')=='warehouse':
+        assigned={t['po_id'] for t in data['tasks'] if t['assigned_to']==user['username'] and t['po_id'] is not None and t.get('task_type')=='warehouse_dispatch'}
+        data['pos']=[p for p in data['pos'] if p['id'] in assigned]
+        numbers={p['number'] for p in data['pos']}
+        data['lines']=[x for x in data['lines'] if x['po_number'] in numbers]
+        data['documents']=[x for x in data['documents'] if x['po_id'] in assigned]
+        data['tasks']=[x for x in data['tasks'] if x['assigned_to']==user['username'] and x.get('task_type')=='warehouse_dispatch']
+        data['regional_rows']=[];data['reminders']=[];data['urgent']=[];data['issues']=[]
+        data['stock']=[];data['batches']=[];data['invoices']=[];data['assigned_invoice_numbers']=[]
+        for p in data['pos']:p['value']=None
+        return data
     if user['is_admin'] or 'reports_view' in user['permissions'].split(','): return data
     perms=set(user['permissions'].split(','))
     if not perms & {'pos_edit','invoice_edit','issue_edit','task_edit'}:
         assigned={t['po_id'] for t in data['tasks'] if t['assigned_to']==user['username'] and t['po_id'] is not None}
-        data['pos']=[p for p in data['pos'] if p['id'] in assigned]
+        data['pos']=[p for p in data['pos'] if p['id'] in assigned or p['added_from_pdf']]
         numbers={p['number'] for p in data['pos']}
         data['lines']=[x for x in data['lines'] if x['po_number'] in numbers]
         data['reminders']=[x for x in data['reminders'] if x['po_id'] in assigned]
@@ -487,11 +506,21 @@ async def task_status(task_id:int,request:Request):
 
 @app.get('/api/reports')
 def reports():
+    dashboard=dashboard_data()
+    pos=dashboard['pos']
+    metrics={'all_po_value':sum(p['value'] or 0 for p in pos),
+             'outstanding_value':sum((p['value'] or 0)*(p['remaining_qty'] or 0)/(p['ordered_qty'] or 1) for p in pos if p['is_outstanding']),
+             'paid_value':sum((p['paid_amount'] or 0) if p['paid_amount'] else (p['value'] or 0) if p['source_stage']=='paid' else 0 for p in pos),
+             'marketplace_value':sum(p['value'] or 0 for p in pos if p['kind']=='marketplace'),
+             'tender_value':sum(p['value'] or 0 for p in pos if p['kind']!='marketplace'),
+             'uploaded_unpaid_value':sum(p['value'] or 0 for p in pos if p['invoice_status']=='invoiced_up')}
     with db() as c:
-        return {'by_region':rows(c,'SELECT region,COUNT(*) po_count,SUM(value) value FROM pos GROUP BY region'),
+        return {'metrics':metrics,
+                'by_region':rows(c,'SELECT region,COUNT(*) po_count,SUM(value) value FROM pos GROUP BY region'),
                 'by_item':rows(c,'SELECT item_code,SUM(quantity) quantity FROM po_lines GROUP BY item_code'),
                 'invoice_status':rows(c,'SELECT status,COUNT(*) count,SUM(value) value FROM invoices GROUP BY status'),
-                'tasks':rows(c,'SELECT assigned_to,status,COUNT(*) count FROM tasks GROUP BY assigned_to,status')}
+                'tasks':rows(c,'SELECT assigned_to,status,COUNT(*) count FROM tasks GROUP BY assigned_to,status'),
+                'dispatched_by_month':rows(c,"SELECT substr(COALESCE(dispatched_at,''),1,7) month,il.batch_id,b.item_code,SUM(il.quantity) quantity FROM invoices i JOIN invoice_lines il ON il.invoice_id=i.id JOIN batches b ON b.id=il.batch_id WHERE i.dispatched_at IS NOT NULL GROUP BY month,il.batch_id,b.item_code ORDER BY month DESC")}
 
 
 @app.get('/api/export/pos.csv')

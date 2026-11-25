@@ -14,11 +14,11 @@ from pathlib import Path
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
 from pydantic import BaseModel
 from pypdf import PdfReader, PdfWriter
 
-from app import DB, app, business_today, db, rows, pallet_size, outstanding_by_line
+from app import DB, app, business_today, db, rows, pallet_size, outstanding_by_line, dashboard_data
 from imports import decode as decode_master, money, qty
 
 DOCS = Path(os.getenv('LOGISTICS_DOCUMENTS', DB.parent / 'documents'))
@@ -29,6 +29,26 @@ BACKUP_LOCK = threading.Lock()
 MAX_FILE = 15_000_000
 CORE_PO = ['open', 'asn_booked', 'dispatched', 'dispatch_cancelled', 'delivered', 'gr_issued', 'asn_cancelled', 'asn_rejected']
 CORE_INVOICE = ['rcv_needed', 'rcv_uploaded', 'ready_to_upload', 'invoiced_up', 'paid', 'partially_paid']
+
+
+def region_from_address(address):
+    text=(address or '').lower()
+    for region,terms in [('Riyadh',('riyadh','الرياض')),('East',('dammam','dhahran','ahsa','الدمام','الأحساء')),('West',('jeddah','makkah','taif','جدة','مكة','الطائف')),('Madinah',('madinah','medina','المدينة')),('Qassim',('qassim','buraidah','القصيم')),('North',('tabuk','jouf','hail','تبوك','الجوف','حائل')),('South',('aseer','abha','jazan','najran','عسير','جازان','نجران'))]:
+        if any(term in text for term in terms):return region
+    return ''
+
+
+@app.get('/api/export/masterlist.xlsx')
+def export_masterlist():
+    book=Workbook();tender=book.active;tender.title='Tender';market=book.create_sheet('Marketplace')
+    header=['PO number','Item','Quantity','Due date','Delivery address','PO value (SAR)','Creation date']
+    for sheet in (tender,market):sheet.append(header)
+    with db() as c:
+        records=rows(c,'SELECT p.number,p.kind,p.value,p.po_created_at,l.item_code,l.quantity,l.due_date,l.address FROM pos p JOIN po_lines l ON l.po_id=p.id ORDER BY p.number,l.line_no')
+    for r in records:
+        (market if r['kind']=='marketplace' else tender).append([r['number'],r['item_code'],r['quantity'],r['due_date'],r['address'],r['value'],r['po_created_at']])
+    out=io.BytesIO();book.save(out);out.seek(0)
+    return StreamingResponse(out,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="sial-po-masterlist.xlsx"'})
 
 
 def fail(message, status=400):
@@ -49,6 +69,19 @@ def create_backup(label):
     return backup_id
 
 
+def relink_documents(c):
+    pending=rows(c,'SELECT * FROM po_document_relinks')
+    linked=0
+    for doc in pending:
+        po=c.execute('SELECT id FROM pos WHERE number=?',(doc['po_number'],)).fetchone()
+        if not po:continue
+        c.execute('INSERT OR IGNORE INTO po_documents(po_id,filename,stored_name,sha256,document_type,uploaded_at) VALUES(?,?,?,?,?,?)',
+                  (po['id'],doc['filename'],doc['stored_name'],doc['sha256'],doc['document_type'],doc['uploaded_at']))
+        c.execute('DELETE FROM po_document_relinks WHERE stored_name=?',(doc['stored_name'],))
+        linked+=1
+    return linked
+
+
 def primary_admin(request):
     if not request.state.user['is_admin']:fail('Primary admin only',403)
     with db() as c:
@@ -60,7 +93,30 @@ def primary_admin(request):
 @app.get('/api/admin/backups')
 def list_backups(request:Request):
     primary_admin(request)
-    return [json.loads(p.read_text()) for p in sorted(BACKUPS.glob('*.json'),reverse=True)[:30]]
+    return [json.loads(p.read_text()) for p in sorted(BACKUPS.glob('*.json'),reverse=True)]
+
+
+class DeleteBackups(BaseModel):
+    ids:list[str]
+    phrase:str
+
+
+@app.post('/api/admin/backups/delete')
+def delete_backups(v:DeleteBackups,request:Request):
+    primary_admin(request)
+    if v.phrase!='DELETE SELECTED BACKUPS':fail('Confirmation phrase required')
+    if not BACKUP_LOCK.acquire(blocking=False):fail('Another database operation is in progress',409)
+    try:
+        ids=v.ids
+        if ids==['*']:ids=[p.stem for p in BACKUPS.glob('*.db')]
+        if not ids:fail('Select at least one backup')
+        if any(not re.fullmatch(r'\d{8}T\d{6}Z-[0-9a-f]{8}',x) for x in ids):fail('Invalid backup ID')
+        for backup_id in set(ids):
+            (BACKUPS/(backup_id+'.db')).unlink(missing_ok=True)
+            (BACKUPS/(backup_id+'.json')).unlink(missing_ok=True)
+        with db() as c:c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'delete_backups',str(len(set(ids)))))
+        return {'deleted':len(set(ids))}
+    finally:BACKUP_LOCK.release()
 
 
 @app.get('/api/admin/backups/{backup_id}')
@@ -97,6 +153,8 @@ def reset_all_pos(v:ResetConfirmation,request:Request):
         backup_id=create_backup('Before resetting all POs and work history')
         with db() as c:
             c.execute('BEGIN IMMEDIATE')
+            c.execute('''INSERT OR IGNORE INTO po_document_relinks(po_number,filename,stored_name,sha256,document_type,uploaded_at)
+              SELECT p.number,d.filename,d.stored_name,d.sha256,d.document_type,d.uploaded_at FROM po_documents d JOIN pos p ON p.id=d.po_id''')
             for r in rows(c,'SELECT batch_id,SUM(quantity) net FROM movements WHERE invoice_id IS NOT NULL GROUP BY batch_id'):
                 c.execute('UPDATE batches SET quantity=quantity-? WHERE id=?',(r['net'],r['batch_id']))
             c.execute('DELETE FROM movements WHERE invoice_id IS NOT NULL')
@@ -193,9 +251,12 @@ def view_document(document_id:int,request:Request):
 
 
 @app.post('/api/pos/{po_id}/documents/upload')
-async def upload_related_document(po_id:int,document_type:str=Form(...),file:UploadFile=File(...)):
-    allowed={'PO','MRR','RCV','Rejection Form','GR','ASN','Invoice','Other'}
+async def upload_related_document(request:Request,po_id:int,document_type:str=Form(...),file:UploadFile=File(...)):
+    allowed={'PO','MRR','RCV','Rejection Form','GR','ASN','Invoice','Odoo Invoice','Nupco Proforma','Nupco Invoice','Delivery Note','Merged Invoice','Other'}
     if document_type not in allowed:fail('Choose a document type')
+    with db() as c:
+        if not request.state.user['is_admin'] and not c.execute("SELECT 1 FROM tasks WHERE po_id=? AND assigned_to=? AND task_type='asn_booking' AND status IN ('open','in_progress','returned')",(po_id,request.state.user['username'])).fetchone():
+            fail('Document upload requires an active ASN assignment',403)
     content=await file.read()
     if not content or len(content)>MAX_FILE:fail('File must be 1 byte to 15 MB')
     suffix=Path(file.filename or '').suffix.lower()
@@ -219,6 +280,44 @@ async def upload_related_document(po_id:int,document_type:str=Form(...),file:Upl
             (DOCS / name).unlink(missing_ok=True)
             raise
     return {'id':doc_id,'duplicate':False}
+
+
+@app.post('/api/pos/{po_id}/documents/merge')
+def merge_invoice_package(po_id:int,request:Request):
+    user=request.state.user
+    with db() as c:
+        po=c.execute('SELECT id,kind FROM pos WHERE id=?',(po_id,)).fetchone()
+        if not po:fail('PO not found',404)
+        task=c.execute("SELECT invoice_number FROM tasks WHERE po_id=? AND assigned_to=? AND task_type='asn_booking' ORDER BY id DESC LIMIT 1",(po_id,user['username'])).fetchone()
+        if not user['is_admin'] and not task and 'merge_pdfs' not in user['permissions'].split(','):fail('Merge permission required',403)
+        number=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po_id,)).fetchone()
+        invoice=(number['number'] if number else task['invoice_number'] if task else '').strip()
+        if not invoice or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}',invoice):fail('Assign an invoice number first')
+        docs=rows(c,'SELECT * FROM po_documents WHERE po_id=? ORDER BY id DESC',(po_id,))
+        by_type={}
+        for doc in docs:by_type.setdefault(doc['document_type'],doc)
+        if po['kind']=='marketplace':
+            needed=['PO','Odoo Invoice','Nupco Invoice']
+            if 'ASN' in by_type:needed+=['ASN','Nupco Proforma']
+            if 'Delivery Note' in by_type:needed+=['Delivery Note']
+            order=['PO','ASN','Odoo Invoice','Nupco Proforma','Nupco Invoice','Delivery Note']
+        else:
+            needed=['PO','ASN','Odoo Invoice','Nupco Proforma']
+            order=needed
+        missing=[t for t in needed if t not in by_type]
+        if missing:fail('Missing required PDFs: '+', '.join(missing))
+        writer=PdfWriter()
+        for kind in order:
+            if kind not in by_type:continue
+            path=DOCS/by_type[kind]['stored_name']
+            if path.suffix.lower()!='.pdf':fail(kind+' must be a PDF')
+            try:writer.append(PdfReader(str(path)))
+            except Exception:fail(kind+' PDF cannot be merged')
+        output=io.BytesIO();writer.write(output)
+        stored=secrets.token_hex(16)+'.pdf';(DOCS/stored).write_bytes(output.getvalue())
+        c.execute('INSERT INTO po_documents(po_id,filename,stored_name,sha256,document_type) VALUES(?,?,?,?,?)',
+                  (po_id,invoice+'.pdf',stored,hashlib.sha256(output.getvalue()).hexdigest(),'Merged Invoice'))
+    return {'ok':True,'filename':invoice+'.pdf'}
 
 
 @app.post('/api/po-pdf/bulk-preview')
@@ -261,8 +360,8 @@ async def bulk_approve(request: Request, files: list[UploadFile] = File(...), fi
                 profile=files_for_po[0][2]
                 existing = c.execute('SELECT id FROM pos WHERE number=?', (number,)).fetchone()
                 if existing: po_id = existing['id']
-                else: po_id = c.execute('INSERT INTO pos(number,kind,customer,customer_po,value) VALUES(?,?,?,?,?)',
-                                        (number,kind,profile['customer'],profile['customer_po'],profile['value'] or 0)).lastrowid
+                else: po_id = c.execute('INSERT INTO pos(number,kind,customer,customer_po,value,added_from_pdf,po_created_at,region) VALUES(?,?,?,?,?,1,?,?)',
+                                        (number,kind,profile['customer'],profile['customer_po'] if kind=='marketplace' else '',profile['value'] or 0,profile.get('created_at') or '',region_from_address(profile['items'][0].get('address','')))).lastrowid
                 extracted = []
                 for _, _, result in files_for_po:
                     for item in result['items']:
@@ -287,8 +386,8 @@ async def bulk_approve(request: Request, files: list[UploadFile] = File(...), fi
                         c.execute('INSERT INTO items(code,pcs_per_box,boxes_per_pallet) VALUES(?,?,?) ON CONFLICT(code) DO NOTHING', (code,pack,pallet_size(code)))
                         c.execute('INSERT INTO po_lines(po_id,line_no,item_code,quantity,due_date,address) VALUES(?,?,?,?,?,?)', (po_id,line_no,code,quantity,due,address))
                     c.execute("UPDATE pos SET address=COALESCE(NULLIF(address,''),?) WHERE id=?", (extracted[0][4],po_id))
-                c.execute("UPDATE pos SET customer=CASE WHEN customer='' THEN ? ELSE customer END,customer_po=CASE WHEN customer_po='' THEN ? ELSE customer_po END,value=CASE WHEN value IS NULL OR value=0 THEN ? ELSE value END WHERE id=?",
-                          (profile['customer'],profile['customer_po'],profile['value'] or 0,po_id))
+                c.execute("UPDATE pos SET customer=CASE WHEN customer='' THEN ? ELSE customer END,customer_po=CASE WHEN kind='marketplace' AND customer_po='' THEN ? ELSE customer_po END,value=CASE WHEN value IS NULL OR value=0 THEN ? ELSE value END,added_from_pdf=1,po_created_at=CASE WHEN po_created_at='' THEN ? ELSE po_created_at END,address_ar=CASE WHEN address_ar='' THEN ? ELSE address_ar END,region=CASE WHEN region='' THEN ? ELSE region END WHERE id=?",
+                          (profile['customer'],profile['customer_po'],profile['value'] or 0,profile.get('created_at') or '',profile.get('address_ar') or '',region_from_address(profile['items'][0].get('address','')),po_id))
                 for filename,content,_ in files_for_po:
                     name = stored_file(c,po_id,filename,content)
                     if name:written.append(name)
@@ -372,6 +471,67 @@ class POStatus(BaseModel):
     confirmed: bool = False
 
 
+class PaymentUpdate(BaseModel):
+    amount_sar:float
+    kind:str
+    reason:str=''
+
+
+@app.post('/api/pos/{po_id}/payment')
+def record_payment(po_id:int,v:PaymentUpdate,request:Request):
+    user=request.state.user
+    if not user['is_admin'] and ('accounting_edit' not in user['permissions'].split(',') or user['role']!='accountant'):
+        fail('Accountant permission required',403)
+    if v.amount_sar<0 or v.kind not in ('partial','complete'):fail('Enter a valid SAR amount and payment type')
+    if v.kind=='partial' and not v.reason.strip():fail('Explain why payment is partial')
+    with db() as c:
+        po=c.execute('SELECT id,status,value FROM pos WHERE id=?',(po_id,)).fetchone()
+        if not po:fail('PO not found',404)
+        if po['status'] not in ('delivered','gr_issued'):fail('Payment requires delivered or GR issued PO')
+        c.execute('UPDATE pos SET paid_amount=?,payment_reason=?,invoice_status=?,archived=? WHERE id=?',
+                  (round(v.amount_sar,2),v.reason.strip(),'paid' if v.kind=='complete' else 'partially_paid',int(v.kind=='complete'),po_id))
+        c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',
+                  (po_id,'payment:'+v.kind,v.reason.strip(),user['id']))
+    return {'ok':True}
+
+
+class DueReschedule(BaseModel):
+    due_date:date
+    reason:str
+
+
+@app.post('/api/po-lines/{line_id}/reschedule')
+def reschedule_ngh(line_id:int,v:DueReschedule,request:Request):
+    if not v.reason.strip():fail('Enter a rescheduling reason')
+    with db() as c:
+        row=c.execute('SELECT l.po_id,p.number,p.address,p.customer FROM po_lines l JOIN pos p ON p.id=l.po_id WHERE l.id=?',(line_id,)).fetchone()
+        if not row:fail('PO line not found',404)
+        if not row['number'].startswith('300') or 'nupco' in (row['address'] or '').lower() or not any(x in ((row['address'] or '')+' '+(row['customer'] or '')).lower() for x in ('ngh','mngha','national guard')):fail('NGH direct delivery PO required')
+        c.execute('UPDATE po_lines SET due_date=? WHERE id=?',(v.due_date.isoformat(),line_id))
+        c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(row['po_id'],'due_rescheduled',v.reason.strip(),request.state.user['id']))
+    return {'ok':True}
+
+
+class CancelQuantity(BaseModel):
+    quantity:int
+    reason:str
+
+
+@app.post('/api/po-lines/{line_id}/cancel-quantity')
+def cancel_po_quantity(line_id:int,v:CancelQuantity,request:Request):
+    if not request.state.user['is_admin']:fail('Admin only',403)
+    if v.quantity<0 or not v.reason.strip():fail('Enter a valid cancelled quantity and reason')
+    with db() as c:
+        line=c.execute('SELECT po_id,quantity FROM po_lines WHERE id=?',(line_id,)).fetchone()
+        if not line:fail('PO line not found',404)
+        delivered=c.execute('''SELECT COALESCE(SUM(il.quantity),0) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
+          WHERE il.po_line_id=? AND i.status IN ('delivered','gr_issued','uploaded','paid')''',(line_id,)).fetchone()[0]
+        if v.quantity>line['quantity']-delivered:fail('Cancelled quantity exceeds undelivered quantity')
+        c.execute('UPDATE po_lines SET cancelled_qty=? WHERE id=?',(v.quantity,line_id))
+        c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(line['po_id'],'quantity_cancelled',v.reason.strip(),request.state.user['id']))
+    return {'ok':True}
+
+
 def options(c, key, core):
     row=c.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
     if not row:return core
@@ -434,6 +594,7 @@ def set_invoice_stage(po_id:int,v:POStatus,request:Request):
         po=c.execute('SELECT * FROM pos WHERE id=?',(po_id,)).fetchone()
         if not po:fail('PO not found',404)
         if v.status not in options(c,'invoice_status_options',CORE_INVOICE):fail('Unknown invoice stage')
+        if v.status in ('paid','partially_paid'):fail('Record the SAR amount and payment type through Payment instead')
         if v.status=='partially_paid' and not v.reason.strip():fail('Enter the partial payment reason')
         if v.status=='paid' and po['status'] not in ('delivered','gr_issued'):fail('PO must be delivered or GR issued before archiving as paid')
         c.execute('UPDATE pos SET invoice_status=?,archived=?,notes=CASE WHEN ?="" THEN notes ELSE COALESCE(notes,"") || CHAR(10) || ? END WHERE id=?',(v.status,int(v.status=='paid'),v.reason,v.reason,po_id))
@@ -455,6 +616,7 @@ def set_marketplace_stage(po_id:int,v:POStatus):
 
 @app.get('/api/reports/operations')
 def operations_report(region:str='',include_archived:bool=False):
+    active={p['id'] for p in dashboard_data()['pos'] if p['is_outstanding']}
     with db() as c:
         sql='''SELECT p.id po_id,p.number,p.region,p.address,p.status,p.invoice_status,p.value,l.id,l.item_code,l.quantity,l.due_date,
           i.pcs_per_box,i.boxes_per_pallet,
@@ -465,6 +627,7 @@ def operations_report(region:str='',include_archived:bool=False):
         outstanding=outstanding_by_line(c,lines)
         by_item=defaultdict(int);by_region_item=defaultdict(int);pick=[]
         for line in lines:
+            if line['po_id'] not in active:continue
             quantity=outstanding[line['id']]
             line['outstanding_qty']=quantity
             line['boxes']=math.ceil(quantity/line['pcs_per_box']) if line['pcs_per_box'] else 0
@@ -667,6 +830,15 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
                 region=next(iter(regions))
                 c.execute('INSERT INTO pos(number,kind,region) VALUES(?,?,?) ON CONFLICT(number) DO NOTHING',(number,'marketplace' if number.startswith('300') else 'tender',region))
                 c.execute('UPDATE pos SET region=? WHERE number=?',(region,number))
+                pid=c.execute('SELECT id FROM pos WHERE number=?',(number,)).fetchone()['id']
+                if not c.execute('SELECT 1 FROM po_lines WHERE po_id=?',(pid,)).fetchone():
+                    for n,r in enumerate((x for x in records if x['po']==number),1):
+                        codes=re.findall(r'\b(?:CTND|RIMZP|RIM|RIB)-\d+\b',r['item_text'])
+                        raw=str(r['planned_qty']).replace(',','')
+                        if len(codes)!=1 or not raw.isdigit() or not r['due_date']:continue
+                        code=codes[0];pack=250 if code=='CTND-200' else 100 if code.startswith('RIMZP-') else 200
+                        c.execute('INSERT INTO items(code,pcs_per_box,boxes_per_pallet) VALUES(?,?,?) ON CONFLICT(code) DO NOTHING',(code,pack,pallet_size(code)))
+                        c.execute('INSERT INTO po_lines(po_id,line_no,item_code,quantity,due_date,address) VALUES(?,?,?,?,?,?)',(pid,f'{n*10:04d}',code,int(raw),r['due_date'],r['address']))
                 if not c.execute('SELECT 1 FROM po_status_events e JOIN pos p ON p.id=e.po_id WHERE p.number=? LIMIT 1',(number,)).fetchone():
                     raw=next((str(r['status']).lower() for r in records if r['po']==number and r['status']), '')
                     status='asn_booked' if 'asn' in raw and 'book' in raw else 'dispatched' if 'dispatch' in raw else 'open'
@@ -676,6 +848,15 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(source,r['sheet'],r['row'],r['po'],r['region'],r['status'],r['invoice_reference'],r['asn_number'],r['asn_date'],r['item_text'],r['planned_qty'],r['left_qty'],r['due_date'],r['address'],r['customer_po']))
                 c.execute("UPDATE pos SET address=CASE WHEN address='' THEN ? ELSE address END,customer_po=CASE WHEN customer_po='' THEN ? ELSE customer_po END,asn_number=CASE WHEN asn_number='' THEN ? ELSE asn_number END,asn_date=CASE WHEN asn_date='' THEN ? ELSE asn_date END WHERE number=?",
                           (r['address'],r['customer_po'],r['asn_number'],r['asn_date'],r['po']))
+            balances=defaultdict(lambda:defaultdict(int))
+            for r in records:
+                codes=re.findall(r'\b(?:CTND|RIMZP|RIM|RIB)-\d+\b',r['item_text'])
+                raw=str(r['left_qty'] if r['left_qty']!='' else r['planned_qty']).replace(',','')
+                if len(codes)==1 and raw.isdigit():balances[r['po']][codes[0]]+=int(raw)
+            for number,by_code in balances.items():
+                pid=c.execute('SELECT id FROM pos WHERE number=?',(number,)).fetchone()['id']
+                for code,count in by_code.items():
+                    c.execute('INSERT INTO po_remaining_snapshot(po_id,item_code,remaining_qty,source_name) VALUES(?,?,?,?) ON CONFLICT(po_id,item_code) DO UPDATE SET remaining_qty=excluded.remaining_qty,source_name=excluded.source_name',(pid,code,count,source))
         else:
             unique={}
             for r in records:
@@ -690,9 +871,9 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
                 regional_outstanding=bool(c.execute('SELECT 1 FROM regional_po_rows WHERE po_number=? LIMIT 1',(number,)).fetchone())
                 if not manual and not regional_outstanding:
                     status='delivered' if r['stage'] in ('paid','uploaded_not_paid','delivered') else 'open'
-                    inv_stage='paid' if r['stage']=='paid' else 'invoiced_up' if r['stage']=='uploaded_not_paid' else 'rcv_needed'
+                    inv_stage='paid' if r['stage']=='paid' else 'invoiced_up' if r['stage']=='uploaded_not_paid' else ''
                     c.execute('UPDATE pos SET status=?,invoice_status=?,archived=? WHERE number=?',(status,inv_stage,int(r['stage']=='paid'),number))
-                if not c.execute('SELECT 1 FROM invoices WHERE po_id=? LIMIT 1',(pid,)).fetchone():
+                if not regional_outstanding and not c.execute('SELECT 1 FROM invoices WHERE po_id=? LIMIT 1',(pid,)).fetchone():
                     remaining={}
                     if r['stage']=='outstanding':
                         for code,amount in re.findall(r'([A-Z]+(?:-[A-Z0-9]+)+)\s*:\s*([\d,]+)',r['remaining_detail']):
@@ -707,6 +888,7 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
                           (source,number,r['value'],r['status'],r['invoice_reference'],r['invoice_status'],r['remaining_detail'],r['remarks'],r['stage']))
         for r in records:
             c.execute('INSERT INTO source_rows(source_name,sheet,row_number,row_json) VALUES(?,?,?,?)',(source,r['sheet'],r['row'],json.dumps(r,ensure_ascii=False)))
+        relink_documents(c)
     return {'already_imported':False,'rows':len(records),'distinct_pos':len({r['po'] for r in records}),'backup_id':backup_id}
 
 class ASNAssignmentBatch(BaseModel):
@@ -771,6 +953,7 @@ class ASNSubmission(BaseModel):
     asn_number:str=''
     asn_date:date
     asn_link:str=''
+    planned_delivery_date:date
     remarks:str=''
 
 
@@ -782,8 +965,8 @@ def submit_asn(task_id:int,v:ASNSubmission,request:Request):
         if not task:fail('ASN task not found',404)
         if task['assigned_to']!=request.state.user['username'] and not request.state.user['is_admin']:fail('This task belongs to another user',403)
         if task['status'] not in ('open','in_progress','returned'):fail('Task cannot be submitted from this state')
-        c.execute("UPDATE tasks SET status='submitted',asn_number=?,asn_date=?,asn_link=?,asn_remarks=?,submitted_at=CURRENT_TIMESTAMP WHERE id=?",
-                  (v.asn_number.strip(),v.asn_date.isoformat(),v.asn_link.strip(),v.remarks.strip(),task_id))
+        c.execute("UPDATE tasks SET status='submitted',asn_number=?,asn_date=?,asn_link=?,planned_delivery_date=?,asn_remarks=?,submitted_at=CURRENT_TIMESTAMP WHERE id=?",
+                  (v.asn_number.strip(),v.asn_date.isoformat(),v.asn_link.strip(),v.planned_delivery_date.isoformat(),v.remarks.strip(),task_id))
         c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'submit_asn',str(task_id)))
     return {'ok':True,'status':'submitted'}
 
@@ -803,6 +986,12 @@ def review_asn(task_id:int,v:ASNReview,request:Request):
         if not task:fail('ASN task not found',404)
         if task['status']!='submitted':fail('Only submitted ASN tasks can be reviewed')
         if v.action=='accept':
+            po=c.execute('SELECT kind FROM pos WHERE id=?',(task['po_id'],)).fetchone()
+            types={r['document_type'] for r in rows(c,'SELECT document_type FROM po_documents WHERE po_id=?',(task['po_id'],))}
+            needed={'PO','ASN','Odoo Invoice','Nupco Proforma'} if po['kind']!='marketplace' else {'PO','Odoo Invoice','Nupco Invoice'}
+            if po['kind']=='marketplace' and 'ASN' in types:needed.add('Nupco Proforma')
+            if not needed.issubset(types):fail('Missing required documents: '+', '.join(sorted(needed-types)))
+            if 'Merged Invoice' not in types:fail('Merge the invoice PDF package before approval')
             c.execute("UPDATE tasks SET status='done',reviewed_at=CURRENT_TIMESTAMP WHERE id=?",(task_id,))
             c.execute('UPDATE pos SET status=?,asn_number=?,asn_date=?,asn_link=? WHERE id=?',
                       ('asn_booked',task['asn_number'],task['asn_date'],task['asn_link'],task['po_id']))
@@ -859,9 +1048,12 @@ def assign_warehouse(v:WarehouseAssignment,request:Request):
 @app.get('/api/warehouse-assignments')
 def list_warehouse_assignments(request:Request):
     with db() as c:
-        query="SELECT t.*,p.number po_number,p.kind,p.status po_status,p.address,p.region FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.task_type='warehouse_dispatch'"
-        if request.state.user['is_admin']:return rows(c,query+' ORDER BY t.id DESC')
-        return rows(c,query+' AND t.assigned_to=? ORDER BY t.id DESC',(request.state.user['username'],))
+        query="SELECT t.*,p.number po_number,p.kind,p.status po_status,p.address,p.address_ar,p.region FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.task_type='warehouse_dispatch'"
+        records=rows(c,query+' ORDER BY t.id DESC') if request.state.user['is_admin'] else rows(c,query+' AND t.assigned_to=? ORDER BY t.id DESC',(request.state.user['username'],))
+        for task in records:
+            task['items']=rows(c,'''SELECT l.item_code,l.quantity,l.due_date,b.batch_no,il.quantity booked_qty FROM po_lines l
+              LEFT JOIN invoice_lines il ON il.po_line_id=l.id LEFT JOIN batches b ON b.id=il.batch_id WHERE l.po_id=? ORDER BY l.line_no''',(task['po_id'],))
+        return records
 
 
 class WarehouseUpdate(BaseModel):

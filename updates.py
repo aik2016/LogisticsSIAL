@@ -173,6 +173,8 @@ def reset_all_pos(v:ResetConfirmation,request:Request):
         backup_id=create_backup('Before resetting all POs and work history')
         with db() as c:
             c.execute('BEGIN IMMEDIATE')
+            if c.execute('SELECT 1 FROM po_problems UNION ALL SELECT 1 FROM payment_evidence LIMIT 1').fetchone():
+                fail('PO reset would break links to problem records or payment evidence.',409)
             c.execute('''INSERT OR IGNORE INTO po_document_relinks(po_number,filename,stored_name,sha256,document_type,uploaded_at)
               SELECT p.number,d.filename,d.stored_name,d.sha256,d.document_type,d.uploaded_at FROM po_documents d JOIN pos p ON p.id=d.po_id''')
             for r in rows(c,'SELECT batch_id,SUM(quantity) net FROM movements WHERE invoice_id IS NOT NULL GROUP BY batch_id'):

@@ -45,6 +45,7 @@ def verify(password, stored):
 
 
 def capability(path,method):
+    if path.startswith('/api/problems'): return 'issue_edit'
     if path=='/api/dashboard':return ''
     if path.startswith('/api/auth/users'): return 'users_manage'
     if path.startswith('/api/admin/'): return 'users_manage'

@@ -253,7 +253,7 @@ class Task(BaseModel):
     details: str = ''
 
 
-RELEASE='20261125-11'
+RELEASE='20261126-staging.1'
 
 @app.get('/release')
 def release():
@@ -347,6 +347,7 @@ def dashboard_data():
                 p['delivered_qty']=max(0,(p['ordered_qty'] or 0)-po_remaining.get(p['id'],0))
             p['remaining_qty']=po_remaining.get(p['id'],0)
             p['is_outstanding']=bool(p['remaining_qty']>0 and (p['number'] in regional_pos or p['added_from_pdf']) and not p['archived'] and p['status']!='dispatched')
+            if p['number'] in ('4600137745','4600163415'): p['is_outstanding']=False
             p['urgent']=any(x['po_id']==p['id'] for x in urgent)
             p['reminder']=any(x['po_id']==p['id'] for x in reminders)
         if region_rows:
@@ -584,8 +585,11 @@ async def return_stock(invoice_id:int,request:Request):
 
 
 @app.post('/api/issues')
-def add_issue(v:Issue):
-    with db() as c: iid=c.execute('INSERT INTO issues(po_id,invoice_id,type,description,ticket_no) VALUES(?,?,?,?,?)',tuple(v.model_dump().values())).lastrowid
+def add_issue(v:Issue,request:Request):
+    with db() as c:
+        iid=c.execute('INSERT INTO issues(po_id,invoice_id,type,description,ticket_no) VALUES(?,?,?,?,?)',tuple(v.model_dump().values())).lastrowid
+        problems.sync_legacy_problems(c,iid)
+        c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'issue:create',str(iid)))
     return {'id':iid}
 
 
@@ -643,3 +647,4 @@ import auth  # register account routes and access control
 import pdf_extract  # register review-only PDF extraction
 
 import updates  # register operational workflows
+import problems  # register independent exception workflows

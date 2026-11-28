@@ -132,3 +132,45 @@ def process_warehouse_status(c,task,value,user):
             c.execute("UPDATE pos SET status='dispatched' WHERE id=?",(task['po_id'],))
     log(c,user,task['po_id'],'dispatched')
     return {'status':'dispatched'}
+
+class ReturnedShipment(BaseModel):
+    quantities: dict[int,int]
+    expected: dict[int,int]
+    complete: bool
+    replacement_invoice: str = ''
+    rejection_document: int | None = None
+
+
+@app.get('/api/pos/{po_id}/dispatch-lines')
+def dispatch_lines(po_id:int):
+    with db() as c:
+        return rows(c, """SELECT il.id,il.quantity,l.item_code,b.batch_no,i.number,i.id invoice_id
+            FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
+            JOIN po_lines l ON l.id=il.po_line_id JOIN batches b ON b.id=il.batch_id
+            WHERE i.po_id=? AND i.status='dispatched' ORDER BY i.id,il.id""",(po_id,))
+
+
+@app.post('/api/pos/{po_id}/dispatch-return/{invoice_id}')
+def dispatch_return(po_id:int, invoice_id:int, value:ReturnedShipment, request:Request):
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        lines=rows(c,"""SELECT il.id,il.po_line_id,il.batch_id,il.quantity,i.number FROM invoice_lines il
+            JOIN invoices i ON i.id=il.invoice_id WHERE i.status='dispatched' AND i.id=? AND i.po_id=?""",(invoice_id,po_id))
+        current={r['id']:r['quantity'] for r in lines}
+        if not current or current!=value.expected:raise HTTPException(409,'Shipment changed. Reopen the return.')
+        qty=current if value.complete else value.quantities
+        if not qty or not any(qty.values()) or any(k not in current or n<0 or n>current[k] for k,n in qty.items()):
+            raise HTTPException(400,'Enter returned quantities within the dispatched amounts')
+        if value.rejection_document and not c.execute('SELECT 1 FROM po_documents WHERE po_id=? AND id=?',(po_id,value.rejection_document)).fetchone():
+            raise HTTPException(400,'Select a document on this PO')
+        for r in lines:
+            n=qty.get(r['id'],0)
+            if not n:continue
+            if n==r['quantity']:c.execute('DELETE FROM invoice_lines WHERE id=?',(r['id'],))
+            else:c.execute('UPDATE invoice_lines SET quantity=quantity-? WHERE id=?',(n,r['id']))
+        if sum(qty.values())==sum(current.values()):c.execute("UPDATE invoices SET status='returned' WHERE id=?",(invoice_id,))
+        c.execute("UPDATE pos SET status='open',archived=0 WHERE id=?",(po_id,))
+        import json
+        reason=json.dumps(dict(invoice=lines[0]['number'],original_lines=lines,returned=qty,new_invoice=value.replacement_invoice.strip(),document=value.rejection_document))
+        c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(po_id,'shipment_returned',reason,request.state.user['id']))
+    return {'ok':True}

@@ -99,7 +99,7 @@ def init_db():
         c.execute("UPDATE items SET boxes_per_pallet=9 WHERE boxes_per_pallet=0 AND (code LIKE 'RIM-%' OR code LIKE 'RIB-%')")
         c.execute("UPDATE items SET boxes_per_pallet=12 WHERE boxes_per_pallet=0 AND code LIKE 'CTND-%'")
         c.execute("UPDATE pos SET invoice_status='' WHERE invoice_status='rcv_needed' AND status='open' AND NOT EXISTS (SELECT 1 FROM invoices WHERE invoices.po_id=pos.id)")
-        c.execute("UPDATE pos SET customer_po='' WHERE kind!='marketplace' AND customer_po<>''")
+        c.execute("UPDATE pos SET customer_po='' WHERE (number LIKE '4600%' OR number LIKE '4300%') AND customer_po<>''")
 
 
 init_db()
@@ -253,7 +253,7 @@ class Task(BaseModel):
     details: str = ''
 
 
-RELEASE='20261128-operations.1'
+RELEASE='20261128-operations.2'
 
 @app.get('/release')
 def release():
@@ -322,7 +322,9 @@ def dashboard_data():
             cancelled=c.execute('SELECT COALESCE(SUM(cancelled_qty),0) FROM po_lines WHERE po_id=?',(p['id'],)).fetchone()[0]
             ordered=p['ordered_qty'] or 0
             p['payable_amount']=round((p['value'] or 0)*max(0,ordered-cancelled)/ordered,2) if ordered else p['value'] or 0
-            p['awaiting_payment_review']=(p['invoice_status']=='paid' or p['source_stage']=='paid' or p['number'] in nupco_paid) and not p['paid_amount'] and p['invoice_status']!='partially_paid'
+            if (p['source_stage']=='paid' or p['number'] in nupco_paid) and p['invoice_status']!='partially_paid':
+                p['invoice_status']='paid'
+            p['awaiting_payment_review']=False
 
         due_lines = rows(c, '''SELECT p.id po_id,p.number,p.customer,p.customer_po,p.region,p.value,p.status,p.overdue_reason,
            l.id,l.line_no,l.item_code,l.quantity,l.quantity ordered_qty,l.cancelled_qty,l.due_date,
@@ -349,7 +351,7 @@ def dashboard_data():
                 p['delivered_qty']=max(0,(p['ordered_qty'] or 0)-po_remaining.get(p['id'],0))
             p['remaining_qty']=po_remaining.get(p['id'],0)
             p['unbooked_qty']=max(0,p['remaining_qty']-reserved_by_po.get(p['id'],0))
-            if p['status'] not in ('booked','dispatched'):p['unbooked_qty']=p['remaining_qty']
+
             p['is_outstanding']=bool(p['unbooked_qty']>0 and (p['number'] in regional_pos or p['added_from_pdf']) and not p['archived'] and p['status']!='dispatched')
             if p['number'] in ('4600137745','4600163415'): p['is_outstanding']=False
             p['urgent']=any(x['po_id']==p['id'] for x in urgent)
@@ -385,7 +387,7 @@ def dashboard_data():
                 'issues':rows(c,'SELECT * FROM issues ORDER BY id DESC'), 'tasks':rows(c,'SELECT * FROM tasks ORDER BY id DESC'),
                 'shipment_history':rows(c,"""SELECT e.po_id,e.status,e.reason,e.created_at,COALESCE(u.username,'') actor
                     FROM po_status_events e LEFT JOIN users u ON u.id=e.user_id
-                    WHERE e.status IN ('booked','with_warehouse','returned_to_accountant','dispatched') ORDER BY e.id DESC"""),
+                    WHERE e.status IN ('booked','with_warehouse','returned_to_accountant','dispatched','due_rescheduled') ORDER BY e.id DESC"""),
                  'lines':[dict(line,outstanding_qty=remaining.get(line['id'])) for line in rows(c,"""SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet,COALESCE(r.qty,0) reserved_qty
                     FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code
                     LEFT JOIN (SELECT il.po_line_id,SUM(il.quantity) qty FROM invoice_lines il

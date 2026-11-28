@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from app import app, db, rows
 
-PERMISSIONS = ('pos_edit','inventory_edit','invoice_edit','issue_edit','task_edit','reports_view','imports_apply','users_manage','merge_pdfs','accounting_edit')
+PERMISSIONS = ('pos_edit','inventory_edit','invoice_edit','issue_edit','task_edit','reports_view','imports_apply','users_manage','merge_pdfs','accounting_edit','ngh_reschedule')
 
 with db() as c:
     c.executescript('''
@@ -60,10 +60,11 @@ def capability(path,method):
     if path.startswith('/api/status-options'): return 'users_manage' if method!='GET' else ''
     if path=='/api/po-pdf/merge':return 'merge_pdfs'
     if path.startswith('/api/po-pdf/'): return 'pos_edit'
+    if path.startswith('/api/pos/') and path.endswith('/dispatch-lines'):return 'pos_edit'
     if path.startswith('/api/pos/') and path.endswith('/documents/upload'):return ''
     if path.startswith('/api/pos/') and path.endswith('/documents/merge'):return ''
     if path.endswith('/payment') and path.startswith('/api/pos/'):return 'accounting_edit'
-    if path.startswith('/api/po-lines/') and path.endswith('/reschedule'):return 'pos_edit'
+    if path=='/api/ngh-schedule' or (path.startswith('/api/po-lines/') and path.endswith('/reschedule')):return 'ngh_reschedule'
     if path.startswith('/api/po-documents/'): return 'imports_apply'
     # Assignment ownership, rather than a broad tool grant, controls ASN submissions.
     if path.startswith('/api/asn-assignments'): return ''
@@ -94,11 +95,15 @@ async def protect(request:Request,call_next):
         user=c.execute('''SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.active=1''',(hashlib.sha256(token.encode()).hexdigest(),int(time.time()))).fetchone() if token else None
     if not user: return JSONResponse({'detail':'Sign in required'},status_code=401)
     request.state.user=dict(user)
+    if not user['is_admin'] and user['permissions']=='ngh_reschedule':
+        if path not in ('/api/auth/me','/api/ngh-schedule') and not (path.startswith('/api/po-lines/') and path.endswith('/reschedule')):
+            return JSONResponse({'detail':'NGH scheduling access only'},status_code=403)
     if user['role']=='warehouse':
         allowed=path in ('/api/dashboard','/api/auth/me','/api/auth/password') or path.startswith(('/api/warehouse-assignments','/api/documents/'))
         if not allowed:return JSONResponse({'detail':'Warehouse access is limited to assigned work'},status_code=403)
     if path not in ('/api/auth/me','/api/auth/password') and not user['is_admin']:
         required=capability(path,request.method)
+        if required=='ngh_reschedule' and 'pos_edit' in user['permissions'].split(','):required=''
         if required and required not in user['permissions'].split(','): return JSONResponse({'detail':f'Permission required: {required}'},status_code=403)
     if request.method in ('POST','PATCH','PUT','DELETE') and path!='/api/auth/login':
         # Custom header is required for browser writes so another site cannot submit a form with the session cookie.

@@ -550,15 +550,28 @@ class DueReschedule(BaseModel):
     reason:str
 
 
+@app.get('/api/ngh-schedule')
+def ngh_schedule():
+    data=dashboard_data()
+    active={p['id']:p for p in data['pos'] if p['is_ngh'] and p['is_outstanding']}
+    return [dict(line_id=l['id'],number=p['number'],customer_po=p['customer_po'],region=p['region'],
+                 item=l['item_code'],remaining=l['outstanding_qty'],due_date=l['due_date'])
+            for l in data['lines'] if (p:=active.get(l['po_id'])) and l['outstanding_qty']]
+
+
 @app.post('/api/po-lines/{line_id}/reschedule')
 def reschedule_ngh(line_id:int,v:DueReschedule,request:Request):
     if not v.reason.strip():fail('Enter a rescheduling reason')
     with db() as c:
-        row=c.execute('SELECT l.po_id,p.number,p.address,p.address_ar,p.customer FROM po_lines l JOIN pos p ON p.id=l.po_id WHERE l.id=?',(line_id,)).fetchone()
-        if not row:fail('PO line not found',404)
-        if not is_direct_ngh(row):fail('NGH direct delivery PO required')
-        c.execute('UPDATE po_lines SET due_date=? WHERE id=?',(v.due_date.isoformat(),line_id))
-        c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(row['po_id'],'due_rescheduled',v.reason.strip(),request.state.user['id']))
+        c.execute('BEGIN IMMEDIATE')
+        row=next((l for l in ngh_schedule() if l['line_id']==line_id),None)
+        if not row:fail('Only outstanding direct NGH lines may be rescheduled',409)
+        new=v.due_date.isoformat()
+        po_id=c.execute('SELECT po_id FROM po_lines WHERE id=?',(line_id,)).fetchone()[0]
+        if row['due_date']==new:return {'ok':True}
+        c.execute('UPDATE po_lines SET due_date=? WHERE id=?',(new,line_id))
+        note=f"{row['number']} · {row['item']} · {row['remaining']} pcs · {row['due_date']} → {new} · {v.reason.strip()}"
+        c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(po_id,'due_rescheduled',note,request.state.user['id']))
     return {'ok':True}
 
 

@@ -5,7 +5,7 @@ import os
 import re
 import secrets
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -253,7 +253,7 @@ class Task(BaseModel):
     details: str = ''
 
 
-RELEASE='20261128-staging.2'
+RELEASE='20261128-staging.3'
 
 @app.get('/release')
 def release():
@@ -342,11 +342,15 @@ def dashboard_data():
             line['urgent']=line['days_to_due']<0
             if line['urgent']:urgent.append(line)
             if 0 <= line['days_to_due'] <= 14:reminders.append(line)
+        reserved_by_po={row['po_id']:row['qty'] for row in rows(c,"""SELECT i.po_id,SUM(l.quantity) qty FROM invoices i
+            JOIN invoice_lines l ON l.invoice_id=i.id WHERE i.status IN ('booked','dispatched') GROUP BY i.po_id""")}
         for p in pos:
             if c.execute('SELECT 1 FROM po_remaining_snapshot WHERE po_id=? LIMIT 1',(p['id'],)).fetchone():
                 p['delivered_qty']=max(0,(p['ordered_qty'] or 0)-po_remaining.get(p['id'],0))
             p['remaining_qty']=po_remaining.get(p['id'],0)
-            p['is_outstanding']=bool(p['remaining_qty']>0 and (p['number'] in regional_pos or p['added_from_pdf']) and not p['archived'] and p['status']!='dispatched')
+            p['unbooked_qty']=max(0,p['remaining_qty']-reserved_by_po.get(p['id'],0))
+            if p['status'] not in ('booked','dispatched'):p['unbooked_qty']=p['remaining_qty']
+            p['is_outstanding']=bool(p['unbooked_qty']>0 and (p['number'] in regional_pos or p['added_from_pdf']) and not p['archived'] and p['status']!='dispatched')
             if p['number'] in ('4600137745','4600163415'): p['is_outstanding']=False
             p['urgent']=any(x['po_id']==p['id'] for x in urgent)
             p['reminder']=any(x['po_id']==p['id'] for x in reminders)
@@ -379,6 +383,9 @@ def dashboard_data():
                 po['delivered_qty']=max(0,po['delivered_qty']-returned)
         return {'pos':pos,'stock':stock,'batches':batch_rows, 'invoices':invoices,
                 'issues':rows(c,'SELECT * FROM issues ORDER BY id DESC'), 'tasks':rows(c,'SELECT * FROM tasks ORDER BY id DESC'),
+                'shipment_history':rows(c,"""SELECT e.po_id,e.status,e.reason,e.created_at,COALESCE(u.username,'') actor
+                    FROM po_status_events e LEFT JOIN users u ON u.id=e.user_id
+                    WHERE e.status IN ('booked','with_warehouse','returned_to_accountant','dispatched') ORDER BY e.id DESC"""),
                 'lines':[dict(line,outstanding_qty=remaining.get(line['id'])) for line in rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date')],
                 'reminders':reminders, 'urgent':urgent,
                 'documents':rows(c,'SELECT d.id,d.po_id,d.filename,d.document_type,d.uploaded_at FROM po_documents d ORDER BY d.id DESC'),
@@ -400,9 +407,10 @@ def dashboard(request:Request):
         data['documents']=[x for x in data['documents'] if x['id'] in packages]
         data['tasks']=[x for x in data['tasks'] if x['assigned_to']==user['username'] and x.get('task_type')=='warehouse_dispatch']
         data['regional_rows']=[];data['reminders']=[];data['urgent']=[];data['issues']=[]
-        data['stock']=[];data['batches']=[];data['invoices']=[];data['assigned_invoice_numbers']=[]
+        data['shipment_history']=[];data['stock']=[];data['batches']=[];data['invoices']=[];data['assigned_invoice_numbers']=[]
         for p in data['pos']:p['value']=None
         return data
+    if not user['is_admin']:data['shipment_history']=[]
     if user['is_admin'] or 'reports_view' in user['permissions'].split(','): return data
     perms=set(user['permissions'].split(','))
     if not perms & {'pos_edit','invoice_edit','issue_edit','task_edit','accounting_edit'}:
@@ -479,8 +487,13 @@ async def update_po(po_id:int,request:Request):
 
 @app.post('/api/invoices')
 def add_invoice(v:Invoice):
+    return reserve_invoice(v)
+
+
+def reserve_invoice(v:Invoice, connection=None):
     if not v.lines: missing('Invoice needs at least one line')
-    with db() as c:
+    with (db() if connection is None else nullcontext(connection)) as c:
+        if connection is None:c.execute('BEGIN IMMEDIATE')
         po=c.execute('SELECT number,archived,status FROM pos WHERE id=?',(v.po_id,)).fetchone()
         if not po: missing('PO not found')
         if po['archived']: missing('Paid PO is archived; reopen it before booking a new invoice')
@@ -495,9 +508,9 @@ def add_invoice(v:Invoice):
         if reserved and reserved['po_id']!=v.po_id:raise HTTPException(409,{'message':'Invoice number assigned to another PO'})
         existing_number=c.execute('''SELECT i.id,i.po_id,p.number po_number FROM invoices i JOIN pos p ON p.id=i.po_id
           WHERE UPPER(COALESCE(NULLIF(i.reference_number,''),i.number))=? ORDER BY i.id''',(reference,)).fetchone()
-        if existing_number and (existing_number['po_id']!=v.po_id or not po['number'].startswith('300')):
+        if existing_number and (existing_number['po_id']!=v.po_id or (connection is None and not po['number'].startswith('300'))):
             raise HTTPException(409,{'message':'Invoice number already booked','invoice_id':existing_number['id'],'po_number':existing_number['po_number']})
-        po_lines=rows(c,'''SELECT l.id,l.po_id,l.item_code,l.quantity,l.due_date,
+        po_lines=rows(c,'''SELECT l.id,l.po_id,l.item_code,l.quantity,l.cancelled_qty,l.due_date,
           COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
             WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
           FROM po_lines l WHERE l.po_id=?''',(v.po_id,))
@@ -648,3 +661,6 @@ import pdf_extract  # register review-only PDF extraction
 
 import updates  # register operational workflows
 import problems  # register independent exception workflows
+
+import shipment_workflow
+import intake

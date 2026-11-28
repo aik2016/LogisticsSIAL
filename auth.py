@@ -45,6 +45,10 @@ def verify(password, stored):
 
 
 def capability(path,method):
+    if path=='/api/due-region-archive': return 'imports_apply'
+    if path.startswith('/api/payment-advice'): return 'accounting_edit'
+    if path.startswith('/api/document-intake'): return 'imports_apply'
+    if path.startswith('/api/shipment-booking/'): return ''
     if path.startswith('/api/problems'): return 'issue_edit'
     if path=='/api/dashboard':return ''
     if path.startswith('/api/auth/users'): return 'users_manage'

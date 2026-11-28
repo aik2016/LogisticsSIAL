@@ -246,7 +246,7 @@ def document_access(c,document_id,request):
     if not row:fail('Document not found',404)
     u=request.state.user
     if u['role']=='warehouse':
-        if not c.execute("SELECT 1 FROM tasks WHERE package_id=? AND assigned_to=? AND task_type='warehouse_dispatch'",(document_id,u['username'])).fetchone():
+        if not c.execute("SELECT 1 FROM tasks WHERE assigned_to=? AND task_type='warehouse_dispatch' AND (package_id=? OR (po_id=? AND EXISTS(SELECT 1 FROM po_documents WHERE id=? AND document_type='PO')))",(u['username'],document_id,row['po_id'],document_id)).fetchone():
             fail('Document access denied',403)
         return row
     if not u['is_admin'] and 'pos_edit' not in u['permissions'].split(','):
@@ -279,6 +279,10 @@ def view_document(document_id:int,request:Request):
 @app.post('/api/pos/{po_id}/documents/upload')
 async def upload_related_document(request:Request,po_id:int,document_type:str=Form(...),file:UploadFile=File(...)):
     allowed={'PO','MRR','RCV','Rejection Form','GR','ASN','Invoice','Odoo Invoice','Nupco Proforma','Nupco Invoice','Delivery Note','Other'}
+    if document_type=='MRR':
+        with db() as c:
+            number=c.execute('SELECT number FROM pos WHERE id=?',(po_id,)).fetchone()
+            if number and number['number'].startswith(('4300','4600')):fail('MRR does not apply to this PO family')
     if document_type not in allowed:fail('Choose a document type')
     with db() as c:
         if not request.state.user['is_admin'] and not c.execute("SELECT 1 FROM tasks WHERE po_id=? AND assigned_to=? AND task_type='asn_booking' AND status IN ('open','in_progress','returned')",(po_id,request.state.user['username'])).fetchone():
@@ -940,7 +944,7 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
 class ASNAssignmentBatch(BaseModel):
     po_ids:list[int]
     assigned_to:str
-    due_date:date
+    due_date:date|None=None
 
 
 @app.post('/api/asn-assignments')
@@ -949,7 +953,7 @@ def assign_asn_batch(v:ASNAssignmentBatch,request:Request):
     ids=list(dict.fromkeys(v.po_ids))
     if not ids or len(ids)>100:fail('Select 1 to 100 outstanding POs')
     with db() as c:
-        target=c.execute('SELECT id,username FROM users WHERE username=? AND active=1',(v.assigned_to.strip(),)).fetchone()
+        target=c.execute('SELECT id,username FROM users WHERE username=? AND active=1 AND role!=?',(v.assigned_to.strip(),'warehouse')).fetchone()
         if not target:fail('Select an active user')
         used={r['number'].upper() for r in rows(c,'SELECT number FROM po_invoice_numbers')}
         used.update(r['reference_number'].upper() for r in rows(c,"SELECT COALESCE(NULLIF(reference_number,''),number) reference_number FROM invoices"))
@@ -960,8 +964,8 @@ def assign_asn_batch(v:ASNAssignmentBatch,request:Request):
             po=c.execute('SELECT id,number,region,address,archived FROM pos WHERE id=?',(po_id,)).fetchone()
             if not po:fail(f'PO {po_id} not found',404)
             if po['archived']:fail(f"{po['number']} is archived")
-            pending=c.execute("SELECT 1 FROM tasks WHERE po_id=? AND task_type='asn_booking' AND status IN ('open','in_progress','submitted','returned') LIMIT 1",(po_id,)).fetchone()
-            if pending:fail(f"{po['number']} already has an active ASN assignment",409)
+            pending=c.execute("SELECT 1 FROM tasks WHERE po_id=? AND task_type='asn_booking' AND status IN ('open','in_progress','submitted','returned','booked','with_warehouse') LIMIT 1",(po_id,)).fetchone()
+            if pending:fail(f"{po['number']} already has an active shipment assignment",409)
             lines=rows(c,'''SELECT l.id,l.po_id,l.item_code,l.quantity,l.due_date,
               COALESCE((SELECT SUM(il.quantity) FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
               WHERE il.po_line_id=l.id AND i.status IN ('delivered','gr_issued','uploaded','paid')),0) delivered_qty
@@ -988,7 +992,7 @@ def assign_asn_batch(v:ASNAssignmentBatch,request:Request):
                 used.add(number)
             details=f"PO {po['number']} · {po['region'] or 'Unassigned'} · Invoice {number} · {po['address'] or 'No address'}"
             task_id=c.execute('''INSERT INTO tasks(title,assigned_to,po_id,due_date,status,details,created_by,task_type,invoice_number)
-              VALUES(?,?,?,?,'open',?,?, 'asn_booking',?)''',('Book ASN',target['username'],po['id'],v.due_date.isoformat(),details,request.state.user['id'],number)).lastrowid
+              VALUES(?,?,?,?,'open',?,?, 'asn_booking',?)''',('Prepare shipment',target['username'],po['id'],v.due_date.isoformat() if v.due_date else None,details,request.state.user['id'],number)).lastrowid
             output.append({'po_id':po['id'],'po_number':po['number'],'invoice_number':number,'task_id':task_id})
         c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'assign_asn_batch',','.join(x['po_number'] for x in output)))
     return {'assignments':output}
@@ -1065,7 +1069,7 @@ def list_asn_assignments(request:Request):
 class WarehouseAssignment(BaseModel):
     po_ids:list[int]
     assigned_to:str
-    due_date:date
+    due_date:date|None=None
 
 
 @app.post('/api/warehouse-assignments')
@@ -1098,7 +1102,7 @@ def assign_warehouse(v:WarehouseAssignment,request:Request):
             details=f"PO {po['number']} · Invoice {invoice or 'Not entered'} · ASN {po['asn_number'] or 'Not required'} · {po['address'] or 'Address not entered'}"
             task_id=c.execute('''INSERT INTO tasks(title,assigned_to,po_id,due_date,status,details,created_by,task_type,invoice_number,asn_number,asn_date,asn_link)
               VALUES(?,?,?,?,'open',?,?,'warehouse_dispatch',?,?,?,?)''',
-              ('Prepare and dispatch',target['username'],po_id,v.due_date.isoformat(),details,request.state.user['id'],invoice,po['asn_number'],po['asn_date'],po['asn_link'])).lastrowid
+              ('Prepare and dispatch',target['username'],po_id,v.due_date.isoformat() if v.due_date else None,details,request.state.user['id'],invoice,po['asn_number'],po['asn_date'],po['asn_link'])).lastrowid
             c.execute('UPDATE tasks SET package_id=?,shipment_invoice_id=? WHERE id=?',(package['id'],shipments[0]['id'],task_id))
             output.append({'task_id':task_id,'po_number':po['number']})
     return {'assignments':output}
@@ -1110,6 +1114,7 @@ def list_warehouse_assignments(request:Request):
         query="SELECT t.*,p.number po_number,p.kind,p.status po_status,p.address,p.address_ar,p.region FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.task_type='warehouse_dispatch'"
         records=rows(c,query+' ORDER BY t.id DESC') if request.state.user['is_admin'] else rows(c,query+' AND t.assigned_to=? ORDER BY t.id DESC',(request.state.user['username'],))
         for task in records:
+            task['po_files']=rows(c,"SELECT id,filename FROM po_documents WHERE po_id=? AND document_type='PO'",(task['po_id'],))
             task['items']=rows(c,'''SELECT l.item_code,il.quantity booked_qty,b.batch_no
                 FROM invoice_lines il JOIN invoices i ON i.id=il.invoice_id
                 JOIN po_lines l ON l.id=il.po_line_id JOIN batches b ON b.id=il.batch_id
@@ -1124,13 +1129,16 @@ class WarehouseUpdate(BaseModel):
 
 @app.post('/api/warehouse-assignments/{task_id}/status')
 def warehouse_status(task_id:int,v:WarehouseUpdate,request:Request):
-    if v.status not in ('dispatched','dispatch_cancelled'):fail('Choose Dispatched or Dispatch Cancelled')
-    if v.status=='dispatch_cancelled' and not v.reason.strip():fail('Enter a cancellation reason')
+    if v.status not in ('dispatched','dispatch_cancelled','returned'):fail('Choose Dispatched or Dispatch Cancelled')
+    if v.status in ('dispatch_cancelled','returned') and not v.reason.strip():fail('Enter a cancellation reason')
     with db() as c:
         task=c.execute("SELECT t.*,p.kind,p.status po_status FROM tasks t JOIN pos p ON p.id=t.po_id WHERE t.id=? AND t.task_type='warehouse_dispatch'",(task_id,)).fetchone()
         if not task:fail('Warehouse assignment not found',404)
         if task['assigned_to']!=request.state.user['username'] and not request.state.user['is_admin']:fail('Assignment belongs to another user',403)
         if task['status'] not in ('open','in_progress'):fail('Assignment is already closed')
+        if task['created_by'] and c.execute("SELECT 1 FROM audit WHERE action='shipment:sent' AND target=?",(str(task_id),)).fetchone():
+            from shipment_workflow import process_warehouse_status
+            return process_warehouse_status(c,task,v,request.state.user)
         if task['kind']!='marketplace' and task['po_status']!='asn_booked':fail('Tender PO requires booked ASN')
         if task['po_status'] not in ('open','asn_booked'):fail('PO cannot be dispatched from its current status')
         if v.status=='dispatched' and (not task['package_id'] or not task['shipment_invoice_id']):fail('This assignment needs a reviewed package and booked shipment')

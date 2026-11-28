@@ -321,7 +321,7 @@ def merge_invoice_package(po_id:int,request:Request):
         po=c.execute('SELECT id,kind,asn_number,asn_link FROM pos WHERE id=?',(po_id,)).fetchone()
         if not po:fail('PO not found',404)
         task=c.execute("SELECT invoice_number FROM tasks WHERE po_id=? AND assigned_to=? AND task_type='asn_booking' ORDER BY id DESC LIMIT 1",(po_id,user['username'])).fetchone()
-        if not user['is_admin'] and 'merge_pdfs' not in user['permissions'].split(','):fail('Merge permission required',403)
+        if not user['is_admin'] and not task and not {'merge_pdfs','pos_edit','pos_view'}.intersection(user['permissions'].split(',')):fail('Merge permission required',403)
         number=c.execute('SELECT number FROM po_invoice_numbers WHERE po_id=?',(po_id,)).fetchone()
         invoice=(number['number'] if number else task['invoice_number'] if task else '').strip()
         if not invoice or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}',invoice):fail('Assign an invoice number first')
@@ -1025,7 +1025,7 @@ class ASNAssignmentBatch(BaseModel):
 def assign_asn_batch(v:ASNAssignmentBatch,request:Request):
     if not request.state.user['is_admin']:fail('Admin only',403)
     ids=list(dict.fromkeys(v.po_ids))
-    if not ids or len(ids)>100:fail('Select 1 to 100 outstanding POs')
+    if not ids or len(ids)>100:fail('Select 1 to 100 pending POs')
     with db() as c:
         target=c.execute('SELECT id,username FROM users WHERE username=? AND active=1 AND role!=?',(v.assigned_to.strip(),'warehouse')).fetchone()
         if not target:fail('Select an active user')
@@ -1318,7 +1318,7 @@ def operations_workbook(region: str = ''):
         return ws
 
     totals = operations['by_item']
-    ws = sheet('Outstanding by item', ['Item', 'Required pieces'], [(r['item_code'], r['quantity']) for r in totals])
+    ws = sheet('Pending by item', ['Item', 'Required pieces'], [(r['item_code'], r['quantity']) for r in totals])
     def chart(ws, obj, title, position):
         if ws.max_row < 2:
             return
@@ -1326,7 +1326,7 @@ def operations_workbook(region: str = ''):
         obj.add_data(Reference(ws, min_col=2, min_row=1, max_row=ws.max_row), titles_from_data=True)
         obj.set_categories(Reference(ws, min_col=1, min_row=2, max_row=ws.max_row))
         ws.add_chart(obj, position)
-    chart(ws, BarChart(), 'Outstanding pieces by item', 'D2')
+    chart(ws, BarChart(), 'Pending pieces by item', 'D2')
     regional = operations['by_region_item']
     sheet('Regional detail', ['Region', 'Item', 'Required pieces'], [(r['region'], r['item_code'], r['quantity']) for r in regional])
     quantities = defaultdict(int)

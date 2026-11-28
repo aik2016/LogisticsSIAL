@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from app import app, db, rows
 
-PERMISSIONS = ('pos_edit','inventory_edit','invoice_edit','issue_edit','task_edit','reports_view','imports_apply','users_manage','merge_pdfs','accounting_edit','ngh_reschedule')
+PERMISSIONS = ('pos_edit','inventory_edit','invoice_edit','issue_edit','task_edit','reports_view','imports_apply','users_manage','merge_pdfs','accounting_edit','ngh_reschedule','inventory_view','pos_view')
 
 with db() as c:
     c.executescript('''
@@ -58,7 +58,7 @@ def capability(path,method):
     if path.startswith('/api/seed/'): return 'imports_apply'
     if path.startswith('/api/inventory/starting-'): return 'inventory_edit'
     if path.startswith('/api/status-options'): return 'users_manage' if method!='GET' else ''
-    if path=='/api/po-pdf/merge':return 'merge_pdfs'
+    if path=='/api/po-pdf/merge':return ''
     if path.startswith('/api/po-pdf/'): return 'pos_edit'
     if path.startswith('/api/pos/') and path.endswith('/dispatch-lines'):return 'pos_edit'
     if path.startswith('/api/pos/') and path.endswith('/documents/upload'):return ''
@@ -96,10 +96,10 @@ async def protect(request:Request,call_next):
     if not user: return JSONResponse({'detail':'Sign in required'},status_code=401)
     request.state.user=dict(user)
     if not user['is_admin'] and user['permissions']=='ngh_reschedule':
-        if path not in ('/api/auth/me','/api/ngh-schedule','/api/ngh-schedule/updates') and not (path.startswith('/api/po-lines/') and path.endswith('/reschedule')):
+        if path not in ('/api/auth/me','/api/po-pdf/merge','/api/ngh-schedule','/api/ngh-schedule/updates') and not (path.startswith('/api/po-lines/') and path.endswith('/reschedule')):
             return JSONResponse({'detail':'NGH scheduling access only'},status_code=403)
     if user['role']=='warehouse':
-        allowed=path in ('/api/dashboard','/api/auth/me','/api/auth/password') or path.startswith(('/api/warehouse-assignments','/api/documents/'))
+        allowed=path in ('/api/po-pdf/merge','/api/dashboard','/api/auth/me','/api/auth/password') or path.startswith(('/api/warehouse-assignments','/api/documents/'))
         if not allowed:return JSONResponse({'detail':'Warehouse access is limited to assigned work'},status_code=403)
     if path not in ('/api/auth/me','/api/auth/password') and not user['is_admin']:
         required=capability(path,request.method)
@@ -119,7 +119,8 @@ class Login(BaseModel):
 @app.post('/api/auth/login')
 def login(v:Login,response:Response):
     with db() as c:
-        user=c.execute('SELECT * FROM users WHERE username=? AND active=1',(v.username.strip(),)).fetchone()
+        matches=c.execute('SELECT * FROM users WHERE username=? COLLATE NOCASE AND active=1',(v.username.strip(),)).fetchall()
+        user=matches[0] if len(matches)==1 else next((u for u in matches if u['username']==v.username.strip()),None)
         if not user or not verify(v.password,user['password_hash']): raise HTTPException(401,'Invalid username or password')
         token=secrets.token_urlsafe(32)
         c.execute('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),user['id'],int(time.time())+12*3600))
@@ -167,6 +168,9 @@ def create_user(v:UserCreate,request:Request):
     with db() as c:
         owner=c.execute("SELECT id FROM users WHERE username='admin' AND is_admin=1").fetchone()
         if v.is_admin and (not request.state.user['is_admin'] or not owner or request.state.user['id']!=owner['id']):raise HTTPException(403,'Only the primary admin can create assistant admins')
+        c.execute('BEGIN IMMEDIATE')
+        if not v.username.strip():raise HTTPException(400,'Enter a username')
+        if c.execute('SELECT 1 FROM users WHERE username=? COLLATE NOCASE',(v.username.strip(),)).fetchone():raise HTTPException(409,'Username already exists')
         try: uid=c.execute('INSERT INTO users(username,email,password_hash,is_admin,permissions,role) VALUES(?,?,?,?,?,?)',(v.username.strip(),v.email.strip().lower(),password_hash,int(v.is_admin),'' if v.role=='warehouse' else ','.join(sorted(set(v.permissions))),v.role)).lastrowid
         except sqlite3.IntegrityError:raise HTTPException(409,'Username already exists')
         c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'create_user',str(uid)))
@@ -174,6 +178,8 @@ def create_user(v:UserCreate,request:Request):
 
 
 class UserUpdate(BaseModel):
+    username:str|None=None
+    is_admin:bool|None=None
     active:bool|None=None
     permissions:list[str]|None=None
     password:str|None=None
@@ -186,12 +192,23 @@ def update_user(user_id:int,v:UserUpdate,request:Request):
     if any(p not in PERMISSIONS for p in (v.permissions or [])):raise HTTPException(400,'Unknown permission')
     if user_id==request.state.user['id'] and v.active is False:raise HTTPException(400,'Cannot deactivate yourself')
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
         target=c.execute('SELECT * FROM users WHERE id=?',(user_id,)).fetchone()
         if not target:raise HTTPException(404,'User not found')
         owner=c.execute("SELECT id FROM users WHERE username='admin' AND is_admin=1").fetchone()
         if owner and user_id==owner['id'] and request.state.user['id']!=owner['id']:raise HTTPException(403,'Primary admin account is protected')
         if target['is_admin'] and not request.state.user['is_admin']:raise HTTPException(403,'Only an admin can change an admin account')
         if owner and user_id==owner['id'] and (v.active is False or v.permissions is not None or v.role is not None):raise HTTPException(400,'Primary admin account cannot be deactivated or restricted')
+        if v.is_admin is not None and bool(target['is_admin'])!=v.is_admin:
+            if not owner or request.state.user['id']!=owner['id'] or user_id==owner['id']:raise HTTPException(403,'Primary admin only')
+            if v.is_admin and (v.role or target['role'])=='warehouse':raise HTTPException(400,'Choose a staff role for an admin assistant')
+            c.execute('UPDATE users SET is_admin=? WHERE id=?',(v.is_admin,user_id))
+        if v.username is not None and v.username.strip()!=target['username']:
+            name=v.username.strip()
+            if not name or owner and user_id==owner['id']:raise HTTPException(400,'Primary admin login is reserved or username is empty')
+            if c.execute('SELECT 1 FROM users WHERE username=? COLLATE NOCASE AND id<>?',(name,user_id)).fetchone():raise HTTPException(409,'Username already exists')
+            c.execute('UPDATE users SET username=? WHERE id=?',(name,user_id))
+            c.execute('UPDATE tasks SET assigned_to=? WHERE assigned_to=?',(name,target['username']))
         if v.role=='warehouse' and target['is_admin']:raise HTTPException(400,'Admin accounts cannot use the warehouse role')
         if v.role is not None:
             if v.role not in ('staff','warehouse','accountant'):raise HTTPException(400,'Unknown role')

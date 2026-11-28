@@ -253,7 +253,7 @@ class Task(BaseModel):
     details: str = ''
 
 
-RELEASE='20261128-operations.3'
+RELEASE='20261128-access.1'
 
 @app.get('/release')
 def release():
@@ -423,7 +423,7 @@ def dashboard(request:Request):
     if not user['is_admin']:data['shipment_history']=[]
     if user['is_admin'] or 'reports_view' in user['permissions'].split(','): return data
     perms=set(user['permissions'].split(','))
-    if not perms & {'pos_edit','invoice_edit','issue_edit','task_edit','accounting_edit'}:
+    if not perms & {'pos_view','pos_edit','invoice_edit','issue_edit','task_edit','accounting_edit'}:
         assigned={t['po_id'] for t in data['tasks'] if t['assigned_to']==user['username'] and t['po_id'] is not None}
         data['pos']=[p for p in data['pos'] if p['id'] in assigned]
         numbers={p['number'] for p in data['pos']}
@@ -436,7 +436,7 @@ def dashboard(request:Request):
         for p in data['pos']:p['value']=None
     else:
         for p in data['pos']+data['lines']+data['reminders']+data['urgent']:p['value']=None
-    if not perms & {'inventory_edit','invoice_edit'}:data['stock']=data['batches']=[]
+    if not perms & {'inventory_view','inventory_edit','invoice_edit'}:data['stock']=data['batches']=[]
     if 'invoice_edit' not in perms:data['invoices']=[]
     if 'issue_edit' not in perms:data['issues']=[]
     if 'task_edit' not in perms:data['tasks']=[]

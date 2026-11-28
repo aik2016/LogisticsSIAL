@@ -698,10 +698,55 @@ def operations_report(region:str='',include_archived:bool=False):
 
 
 # Starting inventory workbook: item code, batch number, quantity, manufacture date, expiry date.
+def decode_warehouse_count(book):
+    records, errors, seen = [], [], set()
+    selected = [sheet for sheet in book if sheet.title.strip() == 'زاريس']
+    if len(selected) != 1:
+        return [], [{'error': 'Expected one زاريس inventory sheet'}]
+    for sheet in selected:
+        rows = enumerate(sheet.values, 1)
+        header = next((row for _, row in rows if 'رقم الباتش' in row), None)
+        if header is None:
+            errors.append({'sheet': sheet.title, 'error': 'Missing batch header'})
+            continue
+        code = ''
+        for n, row in rows:
+            if not any(value is not None for value in row):
+                continue
+            try:
+                fields = dict(zip(header, row))
+                if fields['رمز المنتج'] is not None:
+                    code = str(fields['رمز المنتج']).strip().upper()
+                batch = str(fields['رقم الباتش'] or '').strip()
+                if not code or not batch or (code, batch) in seen:
+                    raise ValueError('Missing or duplicate item/batch')
+                free = fields['الكمية الحرة']
+                reserved = fields.get('الكمية المحجوزة') or 0
+                if reserved or not isinstance(free, (int, float)) or free < 0 or int(free) != free:
+                    raise ValueError('Check free pieces and reconcile booked pieces before import')
+                def stock_date(value):
+                    if value is None:
+                        return ''
+                    if isinstance(value, datetime):
+                        return value.date().isoformat()
+                    if isinstance(value, date):
+                        return value.isoformat()
+                    return datetime.strptime(str(value).strip(), '%d-%m-%Y').date().isoformat()
+                records.append(dict(sheet=sheet.title, row=n, item_code=code, batch_no=batch,
+                                    quantity=int(free), mfg_date=stock_date(fields['تاريخ التصنيع']),
+                                    expiry_date=stock_date(fields['تاريخ الانتهاء'])))
+                seen.add((code, batch))
+            except (KeyError, ValueError) as exc:
+                errors.append({'sheet': sheet.title, 'row': n, 'error': str(exc)})
+    return records, errors
+
+
 def decode_stock(content):
     if len(content)>12_000_000:fail('Workbook exceeds 12 MB',413)
     try:book=load_workbook(io.BytesIO(content),read_only=True,data_only=True)
     except Exception:fail('Could not read XLSX workbook')
+    if any('رقم الباتش' in row for row in book.active.iter_rows(max_row=3,values_only=True)):
+        return decode_warehouse_count(book)
     sheet=book.active
     records=[];errors=[]
     header=[str(x or '').strip().lower().replace(' ','_') for x in next(sheet.iter_rows(values_only=True))]
@@ -759,7 +804,7 @@ async def stock_apply(file:UploadFile=File(...),fingerprint:str=Form(...)):
             c.execute('INSERT INTO items(code,pcs_per_box,boxes_per_pallet) VALUES(?,?,?) ON CONFLICT(code) DO NOTHING',(code,pack,pallet_size(code)))
             c.execute('''INSERT INTO batches(item_code,batch_no,mfg_date,expiry_date,quantity) VALUES(?,?,?,?,?)
               ON CONFLICT(item_code,batch_no) DO UPDATE SET mfg_date=excluded.mfg_date,expiry_date=excluded.expiry_date,quantity=excluded.quantity''',(code,r['batch_no'],r['mfg_date'],r['expiry_date'],r['quantity']))
-            c.execute('INSERT INTO source_rows(source_name,sheet,row_number,row_json) VALUES(?,?,?,?)',(source,'Stock',r['row'],json.dumps(r)))
+            c.execute('INSERT INTO source_rows(source_name,sheet,row_number,row_json) VALUES(?,?,?,?)',(source,r.get('sheet','Stock'),r['row'],json.dumps(r)))
     return {'already_imported':False,'rows':len(records),'backup_id':backup_id}
 
 REGION_SHEETS={'RUH':'Riyadh','North':'North','East':'East','West':'West','Qassim':'Qassim','Med':'Madinah','South':'South'}
@@ -1212,3 +1257,62 @@ def reassign_task(task_id:int, payload:dict, request:Request):
         c.execute("UPDATE tasks SET assigned_to=? WHERE id=?",(assignee,task_id))
         c.execute("INSERT INTO audit(user_id,action,target) VALUES(?,?,?)",(request.state.user['id'],'reassign_task',str(task_id)))
     return {'ok':True}
+
+
+@app.get('/api/reports/workbook.xlsx')
+def operations_workbook(region: str = ''):
+    from openpyxl.chart import BarChart, DoughnutChart, Reference
+    from openpyxl.styles import Font, PatternFill
+    from app import reports
+
+    operations = operations_report(region=region)
+    company = reports()
+    book = Workbook()
+    book.remove(book.active)
+
+    def sheet(title, headings, records):
+        ws = book.create_sheet(title)
+        ws.append(headings)
+        for record in records:
+            ws.append(record)
+            for cell in ws[ws.max_row]:
+                if cell.data_type == 'f':
+                    cell.data_type = 's'
+        ws.freeze_panes = 'A2'
+        ws.auto_filter.ref = ws.dimensions
+        ws.sheet_view.showGridLines = False
+        for cell in ws[1]:
+            cell.font = Font(bold=True, color='FFFFFF')
+            cell.fill = PatternFill('solid', fgColor='194893')
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width = min(65, max(14, max(len(str(c.value or '')) for c in col) + 3))
+        return ws
+
+    totals = operations['by_item']
+    ws = sheet('Outstanding by item', ['Item', 'Required pieces'], [(r['item_code'], r['quantity']) for r in totals])
+    def chart(ws, obj, title, position):
+        if ws.max_row < 2:
+            return
+        obj.title = title
+        obj.add_data(Reference(ws, min_col=2, min_row=1, max_row=ws.max_row), titles_from_data=True)
+        obj.set_categories(Reference(ws, min_col=1, min_row=2, max_row=ws.max_row))
+        ws.add_chart(obj, position)
+    chart(ws, BarChart(), 'Outstanding pieces by item', 'D2')
+    regional = operations['by_region_item']
+    sheet('Regional detail', ['Region', 'Item', 'Required pieces'], [(r['region'], r['item_code'], r['quantity']) for r in regional])
+    quantities = defaultdict(int)
+    for r in regional:
+        quantities[r['region']] += r['quantity']
+    ws = sheet('Regional distribution', ['Region', 'Required pieces'], sorted(quantities.items()))
+    chart(ws, DoughnutChart(), 'Share of outstanding pieces', 'D2')
+    sheet('Warehouse pick list', ['PO','Region','Item','Pieces','Boxes','Pallets','Address','Batches'],
+          [(r['number'],r['region'],r['item_code'],r['outstanding_qty'],r['boxes'],r['pallets'],r['address'],
+            ', '.join(f"{b['batch_no']} ({b['quantity']}, {b['source']})" for b in r['batches'])) for r in operations['warehouse_pick_list']])
+    ws = sheet('Company financials', ['Company-wide measure','Value (SAR)'], [(k.replace('_',' ').title(),v) for k,v in company['metrics'].items()])
+    for cell in ws['B'][1:]:
+        cell.number_format = '#,##0.00'
+    stream = io.BytesIO()
+    book.save(stream)
+    stream.seek(0)
+    return StreamingResponse(stream, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                             headers={'Content-Disposition':'attachment; filename="Sial-Operations.xlsx"'})

@@ -253,7 +253,7 @@ class Task(BaseModel):
     details: str = ''
 
 
-RELEASE='20261128-staging.3'
+RELEASE='20261128-operations.1'
 
 @app.get('/release')
 def release():
@@ -386,7 +386,11 @@ def dashboard_data():
                 'shipment_history':rows(c,"""SELECT e.po_id,e.status,e.reason,e.created_at,COALESCE(u.username,'') actor
                     FROM po_status_events e LEFT JOIN users u ON u.id=e.user_id
                     WHERE e.status IN ('booked','with_warehouse','returned_to_accountant','dispatched') ORDER BY e.id DESC"""),
-                'lines':[dict(line,outstanding_qty=remaining.get(line['id'])) for line in rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date')],
+                 'lines':[dict(line,outstanding_qty=remaining.get(line['id'])) for line in rows(c,"""SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet,COALESCE(r.qty,0) reserved_qty
+                    FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code
+                    LEFT JOIN (SELECT il.po_line_id,SUM(il.quantity) qty FROM invoice_lines il
+                    JOIN invoices v ON v.id=il.invoice_id WHERE v.status IN ('booked','dispatched')
+                    GROUP BY il.po_line_id) r ON r.po_line_id=l.id ORDER BY l.due_date""")],
                 'reminders':reminders, 'urgent':urgent,
                 'documents':rows(c,'SELECT d.id,d.po_id,d.filename,d.document_type,d.uploaded_at FROM po_documents d ORDER BY d.id DESC'),
                 'regional_rows':region_rows,

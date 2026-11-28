@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sial Logistics Control</title><link rel="stylesheet" href="/static/app.css?v=20261128-staging.3"><link rel="stylesheet" href="/static/design.css?v=2"></head>
-<body><button id="release-notice" hidden type="button" onclick="location.reload()">Update available · Reload</button><div id="app"></div><footer class="release-info">Release 20261128-staging.3</footer><div id="toast" role="status" aria-live="polite"></div><script defer src="/static/lucide.min.js"></script><script defer src="/static/design.js?v=2"></script><script defer src="/static/problems.js?v=2"></script><script defer src="/static/shipments.js?v=1"></script><script src="/static/app.js?v=20261128-staging.3" defer></script><script>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sial Logistics Control</title><link rel="stylesheet" href="/static/app.css?v=20261128-operations.1"><link rel="stylesheet" href="/static/design.css?v=2"></head>
+<body><button id="release-notice" hidden type="button" onclick="location.reload()">Update available · Reload</button><div id="app"></div><footer class="release-info">Release 20261128-operations.1</footer><div id="toast" role="status" aria-live="polite"></div><script defer src="/static/lucide.min.js"></script><script defer src="/static/design.js?v=2"></script><script defer src="/static/problems.js?v=2"></script><script defer src="/static/shipments.js?v=1"></script><script src="/static/app.js?v=20261128-operations.1" defer></script><script>
 const checkRelease = async () => {
   try {
     const response = await fetch('/release', {cache: 'no-store'});
-    if (response.ok && (await response.text()).trim() !== '20261128-staging.3') {
+    if (response.ok && (await response.text()).trim() !== '20261128-operations.1') {
       document.getElementById('release-notice').hidden = false;
     }
   } catch (_) {}

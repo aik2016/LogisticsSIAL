@@ -64,7 +64,7 @@ def capability(path,method):
     if path.startswith('/api/pos/') and path.endswith('/documents/upload'):return ''
     if path.startswith('/api/pos/') and path.endswith('/documents/merge'):return ''
     if path.endswith('/payment') and path.startswith('/api/pos/'):return 'accounting_edit'
-    if path=='/api/ngh-schedule' or (path.startswith('/api/po-lines/') and path.endswith('/reschedule')):return 'ngh_reschedule'
+    if path.startswith('/api/ngh-schedule') or (path.startswith('/api/po-lines/') and path.endswith('/reschedule')):return 'ngh_reschedule'
     if path.startswith('/api/po-documents/'): return 'imports_apply'
     # Assignment ownership, rather than a broad tool grant, controls ASN submissions.
     if path.startswith('/api/asn-assignments'): return ''
@@ -96,7 +96,7 @@ async def protect(request:Request,call_next):
     if not user: return JSONResponse({'detail':'Sign in required'},status_code=401)
     request.state.user=dict(user)
     if not user['is_admin'] and user['permissions']=='ngh_reschedule':
-        if path not in ('/api/auth/me','/api/ngh-schedule') and not (path.startswith('/api/po-lines/') and path.endswith('/reschedule')):
+        if path not in ('/api/auth/me','/api/ngh-schedule','/api/ngh-schedule/updates') and not (path.startswith('/api/po-lines/') and path.endswith('/reschedule')):
             return JSONResponse({'detail':'NGH scheduling access only'},status_code=403)
     if user['role']=='warehouse':
         allowed=path in ('/api/dashboard','/api/auth/me','/api/auth/password') or path.startswith(('/api/warehouse-assignments','/api/documents/'))

@@ -83,12 +83,12 @@ def relink_documents(c):
 
 
 @app.post('/api/admin/enrich-po-pdfs')
-def enrich_po_pdfs(request:Request,after_id:int=0,limit:int=20):
+def enrich_po_pdfs(request:Request,after_id:int=0,limit:int=20,ngh_only:bool=False):
     primary_admin(request)
     if not 1<=limit<=25:fail('Limit must be 1 to 25')
     from pdf_extract import extract
     with db() as c:
-        documents=rows(c,"SELECT d.id,d.po_id,d.stored_name FROM po_documents d WHERE d.id>? AND d.document_type='PO' ORDER BY d.id LIMIT ?",(after_id,limit))
+        documents=rows(c,"SELECT d.id,d.po_id,d.stored_name,p.number FROM po_documents d JOIN pos p ON p.id=d.po_id WHERE d.id>? AND d.document_type='PO' AND (?=0 OR (p.number LIKE '300%' AND COALESCE(p.customer_po,'')='')) ORDER BY d.id LIMIT ?",(after_id,ngh_only,limit))
     updated=0;errors=[]
     for doc in documents:
         path=DOCS/doc['stored_name']
@@ -96,6 +96,8 @@ def enrich_po_pdfs(request:Request,after_id:int=0,limit:int=20):
         try:result=extract(path.read_bytes())
         except Exception:errors.append(doc['id']);continue
         with db() as c:
+            if result.get('po_number')==doc['number'] and result.get('customer_po'):
+                c.execute("UPDATE pos SET customer_po=? WHERE id=? AND COALESCE(customer_po,'')=''",(result['customer_po'],doc['po_id']))
             c.execute("UPDATE pos SET po_created_at=CASE WHEN po_created_at='' THEN ? ELSE po_created_at END,address_ar=CASE WHEN address_ar='' THEN ? ELSE address_ar END WHERE id=?",
                       (result.get('created_at') or '',result.get('address_ar') or '',doc['po_id']))
         updated+=1
@@ -547,21 +549,20 @@ def record_payment(po_id:int,v:PaymentUpdate,request:Request):
 
 class DueReschedule(BaseModel):
     due_date:date
-    reason:str
+    reason:str=''
 
 
 @app.get('/api/ngh-schedule')
 def ngh_schedule():
     data=dashboard_data()
     active={p['id']:p for p in data['pos'] if p['is_ngh'] and p['is_outstanding']}
-    return [dict(line_id=l['id'],number=p['number'],customer_po=p['customer_po'],region=p['region'],
+    return [dict(days_to_due=(date.fromisoformat(l['due_date'])-business_today()).days if re.fullmatch(r'\d{4}-\d{2}-\d{2}',str(l['due_date'])) else None,line_id=l['id'],number=p['number'],customer_po=p['customer_po'],region=p['region'],
                  item=l['item_code'],remaining=l['outstanding_qty'],due_date=l['due_date'])
             for l in data['lines'] if (p:=active.get(l['po_id'])) and l['outstanding_qty']]
 
 
 @app.post('/api/po-lines/{line_id}/reschedule')
 def reschedule_ngh(line_id:int,v:DueReschedule,request:Request):
-    if not v.reason.strip():fail('Enter a rescheduling reason')
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         row=next((l for l in ngh_schedule() if l['line_id']==line_id),None)
@@ -570,7 +571,7 @@ def reschedule_ngh(line_id:int,v:DueReschedule,request:Request):
         po_id=c.execute('SELECT po_id FROM po_lines WHERE id=?',(line_id,)).fetchone()[0]
         if row['due_date']==new:return {'ok':True}
         c.execute('UPDATE po_lines SET due_date=? WHERE id=?',(new,line_id))
-        note=f"{row['number']} · {row['item']} · {row['remaining']} pcs · {row['due_date']} → {new} · {v.reason.strip()}"
+        note=f"{row['number']} · {row['item']} · {row['remaining']} pcs · {row['due_date']} → {new}"
         c.execute('INSERT INTO po_status_events(po_id,status,reason,user_id) VALUES(?,?,?,?)',(po_id,'due_rescheduled',note,request.state.user['id']))
     return {'ok':True}
 
@@ -896,11 +897,15 @@ async def seed_preview(kind:str,file:UploadFile=File(...)):
 
 
 @app.post('/api/seed/{kind}/apply')
-async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...)):
+async def seed_apply(kind:str,request:Request,file:UploadFile=File(...),fingerprint:str=Form(...)):
+    primary_admin(request)
     content=await file.read()
     if hashlib.sha256(content).hexdigest()!=fingerprint:fail('Workbook changed since preview')
     records,errors=decode_seed(content,kind)
     if errors or not records:fail('Correct preview errors first')
+    from intake import archive_members,apply_archive
+    archive=archive_members(content,records) if kind=='due_region' else None
+    notices=[]
     source=kind+':'+fingerprint[:16]
     with db() as c:
         if c.execute('SELECT 1 FROM source_rows WHERE source_name=? LIMIT 1',(source,)).fetchone():return {'already_imported':True,'rows':0}
@@ -934,6 +939,14 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
             for r in records:mapping[r['po']].add(r['region'])
             conflict={po:sorted(regions) for po,regions in mapping.items() if len(regions)>1}
             if conflict:fail(f'POs appear in multiple regions: {str(conflict)[:300]}',409)
+            for r in records:
+                if not r['due_date']:continue
+                for item,_ in regional_item_quantities(r['item_text'],r['left_qty'] or r['planned_qty']):
+                    lines=rows(c,'SELECT l.id,l.due_date FROM po_lines l JOIN pos p ON p.id=l.po_id WHERE p.number=? AND l.item_code=?',(r['po'],item))
+                    if any(line['due_date']==r['due_date'] for line in lines):continue
+                    if lines and (len(lines)>1 or c.execute("SELECT 1 FROM po_status_events e JOIN pos p ON p.id=e.po_id WHERE p.number=? AND e.status='due_rescheduled'",(r['po'],)).fetchone()):
+                        notices.append(r['po']+' · '+item+' · Workbook date '+r['due_date'])
+                    elif lines:c.execute('UPDATE po_lines SET due_date=? WHERE id=?',(r['due_date'],lines[0]['id']))
             for number,regions in mapping.items():
                 region=next(iter(regions))
                 c.execute('INSERT INTO pos(number,kind,region) VALUES(?,?,?) ON CONFLICT(number) DO NOTHING',(number,'marketplace' if number.startswith('300') else 'tender',region))
@@ -994,10 +1007,13 @@ async def seed_apply(kind:str,file:UploadFile=File(...),fingerprint:str=Form(...
                           (pid,code,remaining.get(code,0),source))
                 c.execute('INSERT INTO source_status(source_name,po_number,value,status,invoice_reference,invoice_status,remaining_detail,remarks,stage) VALUES(?,?,?,?,?,?,?,?,?)',
                           (source,number,r['value'],r['status'],r['invoice_reference'],r['invoice_status'],r['remaining_detail'],r['remarks'],r['stage']))
+        if archive:
+            outcome=apply_archive(c,archive,request,content,backup_id)
+            notices.extend(outcome['conflicts'])
         for r in records:
             c.execute('INSERT INTO source_rows(source_name,sheet,row_number,row_json) VALUES(?,?,?,?)',(source,r['sheet'],r['row'],json.dumps(r,ensure_ascii=False)))
         relink_documents(c)
-    return {'already_imported':False,'rows':len(records),'distinct_pos':len({r['po'] for r in records}),'backup_id':backup_id}
+    return {'conflicts':notices,'already_imported':False,'rows':len(records),'distinct_pos':len({r['po'] for r in records}),'backup_id':backup_id}
 
 class ASNAssignmentBatch(BaseModel):
     po_ids:list[int]
@@ -1329,3 +1345,49 @@ def operations_workbook(region: str = ''):
     stream.seek(0)
     return StreamingResponse(stream, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                              headers={'Content-Disposition':'attachment; filename="Sial-Operations.xlsx"'})
+
+@app.get('/api/ngh-schedule/updates')
+def ngh_changes():
+    with db() as c:
+        return rows(c,"""SELECT p.number,p.region,e.created_at,e.reason,u.username FROM po_status_events e
+            JOIN pos p ON p.id=e.po_id LEFT JOIN users u ON u.id=e.user_id
+            WHERE e.status='due_rescheduled' ORDER BY e.id DESC LIMIT 200""")
+
+
+@app.post('/api/admin/sync-inventory')
+async def sync_inventory(request:Request,file:UploadFile=File(...),counted_at:datetime=Form(...)):
+    primary_admin(request)
+    from datetime import timezone
+    if counted_at.tzinfo is None or counted_at>datetime.now(timezone.utc):fail('Enter the time of the warehouse count')
+    content=await file.read()
+    records,errors=decode_stock(content)
+    if errors or not records or any(r.get('sheet','').strip()!='زاريس' for r in records):fail('Use the Zarys warehouse count workbook')
+    source='zarys-count:'+hashlib.sha256(content).hexdigest()
+    timestamp=counted_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    changed=0;conflicts=[]
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        for r in records:
+            if c.execute('SELECT 1 FROM source_rows WHERE source_name=? AND sheet=? AND row_number=?',(source,r['sheet'],r['row'])).fetchone():continue
+            code,batch=r['item_code'],r['batch_no']
+            existing=c.execute('SELECT * FROM batches WHERE item_code=? AND batch_no=?',(code,batch)).fetchone()
+            reserved=0
+            if existing:
+                bid=existing['id']
+                reserved=c.execute("""SELECT COALESCE(SUM(l.quantity),0) FROM invoice_lines l JOIN invoices i ON i.id=l.invoice_id
+                    WHERE l.batch_id=? AND i.status IN ('booked','dispatched')""",(bid,)).fetchone()[0]
+                delta=r['quantity']+reserved-existing['quantity']
+                if delta and (reserved or c.execute('SELECT 1 FROM movements WHERE batch_id=? AND created_at>=?',(bid,timestamp)).fetchone()):
+                    conflicts.append(f'{code} / {batch}: check reservations or newer movements');continue
+            else:
+                pack=250 if code=='CTND-200' else 100 if code.startswith('RIMZP-') else 200 if code.startswith(('RIM-','RIB-')) else 1
+                c.execute('INSERT OR IGNORE INTO items(code,pcs_per_box,boxes_per_pallet) VALUES(?,?,?)',(code,pack,pallet_size(code)))
+                bid=c.execute('INSERT INTO batches(item_code,batch_no,mfg_date,expiry_date,quantity) VALUES(?,?,?,?,0)',(code,batch,r['mfg_date'],r['expiry_date'])).lastrowid
+                delta=r['quantity']
+            if delta:
+                c.execute('UPDATE batches SET quantity=quantity+? WHERE id=?',(delta,bid))
+                c.execute("INSERT INTO movements(batch_id,quantity,type) VALUES(?,?,'warehouse_count')",(bid,delta))
+                changed+=1
+            c.execute('INSERT INTO source_rows(source_name,sheet,row_number,row_json) VALUES(?,?,?,?)',(source,r['sheet'],r['row'],json.dumps(r)))
+        c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'inventory:sync',source))
+    return {'changed':changed,'conflicts':conflicts}

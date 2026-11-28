@@ -48,7 +48,7 @@ def extract(content):
     for n,line in enumerate(header):
         if 'Customer PO' in line or 'Cust. PO' in line:
             nearby=' '.join(header[n:n+3])
-            candidates=re.findall(r'\b(?:[A-Z]{1,6}[-/]?\d{3,20}|\d{10,22})\b',nearby)
+            candidates=re.findall(r'\b(?:[A-Z]{1,6}[-/]?\d{3,20}|\d{9,22})\b',nearby)
             customer_po=next((x for x in candidates if not po_match or x!=po_match.group(0)),'')
             if customer_po:break
     customer=''

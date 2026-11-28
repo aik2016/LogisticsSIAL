@@ -40,3 +40,19 @@ input,select,textarea,input[type=file]{background-color:var(--surface);color:var
 .shell .po-urgent{border-inline-start:3px solid var(--danger)}
 
 .report-tools{display:flex;align-items:end;gap:.75rem;flex-wrap:wrap;margin-block:1rem}.report-tools label{min-width:12rem;margin-inline-end:auto}.report-profile{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:1rem;margin-block:1rem}.report-profile section{background:var(--surface,Canvas);color:var(--text,CanvasText);border:1px solid var(--border,#bbc4d255);padding:clamp(1rem,2vw,2rem);border-radius:16px}.report-profile h3{margin:0 0 1.25rem}.mix{display:flex;align-items:center;flex-wrap:wrap;gap:1.4rem}.ring{width:clamp(130px,12vw,180px);aspect-ratio:1;border-radius:50%;display:grid;place-items:center}.ring>div{width:74%;height:74%;border-radius:50%;background:var(--surface,Canvas);display:grid;align-content:center;text-align:center}.ring strong{font-size:clamp(16px,1.5vw,23px);font-variant-numeric:tabular-nums}.mix ul{flex:1;min-width:145px;padding:0;list-style:none}.mix li{display:flex;align-items:center;gap:.55rem;margin:.65rem 0;font-size:.9rem}.mix li i{width:9px;height:9px;border-radius:50%}.mix li b{margin-inline-start:auto}.report-profile .chart-row{width:100%}.card>summary{cursor:pointer}.card .stats-five{grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr))}.card .stat strong{font-size:clamp(18px,1.7vw,26px);font-variant-numeric:tabular-nums}
+
+.workspace-tabs,.ops-actions,.queue-head{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.workspace-tabs{margin-block:.7rem}
+.workspace-tabs button,.ops-actions button{width:auto;border:1px solid #9baac2;border-radius:8px;padding:.42rem .8rem;background:transparent;color:inherit}
+.workspace-tabs .chosen,.ops-actions .actions button{background:#234fb3;color:white;border-color:#234fb3}
+.ops-dashboard{display:grid;gap:.85rem}
+.ops-dashboard .stats{display:flex;flex-wrap:wrap;gap:.65rem;margin:0}
+.ops-dashboard .stat{flex:0 1 13rem;padding:.6rem 1rem;min-height:0;text-align:start}
+.ops-dashboard .stat strong{font-size:1.65rem}
+.ops-actions .actions{margin:0}
+.priority-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,3fr);gap:.9rem;align-items:start}
+.priority-layout .chart-track{height:7px}
+.queue-head{justify-content:space-between}
+.queue-head label{width:auto}
+.ops-dashboard .shortage-strip{padding:.65rem 1rem}
+@media(max-width:800px){.priority-layout{grid-template-columns:1fr}}

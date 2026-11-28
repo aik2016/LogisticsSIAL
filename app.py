@@ -253,7 +253,7 @@ class Task(BaseModel):
     details: str = ''
 
 
-RELEASE='20261128-operations.2'
+RELEASE='20261128-operations.3'
 
 @app.get('/release')
 def release():
@@ -358,13 +358,17 @@ def dashboard_data():
             p['reminder']=any(x['po_id']==p['id'] for x in reminders)
         if region_rows:
             by_number={p['number']:p for p in pos}
-            reminders=[];urgent=[]
+            live_ids={r[0] for r in c.execute("SELECT DISTINCT po_id FROM po_status_events WHERE status='due_rescheduled'")}
+            live_ids.update(p['id'] for p in pos if p['added_from_pdf'] and p['number'] not in regional_pos)
+            live_ids.intersection_update(p['id'] for p in pos if p['is_outstanding'])
+            reminders=[x for x in reminders if x['po_id'] in live_ids]
+            urgent=[x for x in urgent if x['po_id'] in live_ids]
             for regional in region_rows:
                 parent=by_number.get(regional['po_number'])
                 raw_date=str(regional['due_date'] or '')[:10]
                 try:days=(date.fromisoformat(raw_date)-today).days
                 except ValueError:continue
-                if not parent:continue
+                if not parent or parent['id'] in live_ids:continue
                 if not parent['due_date'] or raw_date<parent['due_date']:parent['due_date']=raw_date
                 quantity_text=str(regional['left_qty'] or regional['planned_qty'] or '0').replace(',','')
                 try:quantity=int(float(quantity_text))

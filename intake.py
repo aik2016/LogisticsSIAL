@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from fastapi import File, HTTPException, Request, UploadFile
+from fastapi import Form, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from openpyxl import load_workbook
 
@@ -225,7 +225,7 @@ def download_review_file(file_id:int):
 
 
 @app.post('/api/document-intake')
-async def document_intake(request:Request,file:UploadFile=File(...)):
+async def document_intake(request:Request,file:UploadFile=File(...),document_type:str=Form('')):
     from updates import DOCS
     from secrets import token_hex
     content=await read_upload(file)
@@ -233,11 +233,16 @@ async def document_intake(request:Request,file:UploadFile=File(...)):
     except HTTPException as error:
         if error.status_code!=422:raise
         with db() as c:return review_document(c,file,content,'Document could not be read')
-    kind=identify_document(text)
+    selected=document_type if isinstance(document_type,str) else ''
+    if selected and selected not in ('PO','GR','MRR','RCV','ASN','Invoice','Rejection Form','Delivery Note','Other'):
+        raise HTTPException(422,'Unknown document type')
+    detected=identify_document(text)
+    kind=selected or detected
     numbers=set(re.findall(r'\b(?:300\d{7}|4[36]00\d{6})\b',text))
     refs=set(re.findall(r'\b(?:N\d{2,}|[MT]\d{3,})\b',text,re.I))
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
+        if selected and detected and selected!=detected:return review_document(c,file,content,'Selected type differs from document text')
         if not kind:return review_document(c,file,content,'Document type is ambiguous')
         if len(numbers)>1:return review_document(c,file,content,'Multiple PO numbers found')
         candidates=set()
@@ -282,6 +287,14 @@ async def archive_from_due_region(request:Request,file:UploadFile=File(...)):
     records,errors=decode_seed(content,'due_region')
     if errors or not records:
         raise HTTPException(422,'Use a valid Due and Region workbook')
+    snapshot=archive_members(content,records)
+    backup=create_backup('Before Due and Region archive reconciliation')
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        return apply_archive(c,snapshot,request,content,backup)
+
+
+def archive_members(content,records):
     workbook=load_workbook(io.BytesIO(content),read_only=True,data_only=True)
     active={row['po'] for row in records}
     mentioned=set(active)
@@ -304,28 +317,30 @@ async def archive_from_due_region(request:Request,file:UploadFile=File(...)):
                     if sheet in waiting_sheets:uploaded.add(number)
     workbook.close()
     conflict=active & uploaded
-    backup=create_backup('Before Due and Region archive reconciliation')
+    return active,uploaded,mentioned,conflict
+
+
+def apply_archive(c,snapshot,request,content,backup):
+    active,uploaded,mentioned,conflict=snapshot
     changed=0
-    with db() as c:
-        c.execute('BEGIN IMMEDIATE')
-        for order in c.execute('SELECT id,number,status,archived,invoice_status FROM pos').fetchall():
-            number=order['number']
-            if number in conflict and number!='4300006061':continue
-            invoice_stage=order['invoice_status']
-            if number in uploaded and invoice_stage not in ('paid','partially_paid'):
-                invoice_stage='invoiced_up'
-            if number=='4300006061' or number not in mentioned or invoice_stage in ('invoiced_up','paid','partially_paid') and number in uploaded:
-                archived=1
-            elif number in active:
-                archived=int(invoice_stage in ('invoiced_up','paid'))
-            else:
-                archived=order['archived']
-            if (archived,invoice_stage)!=(order['archived'],order['invoice_status']):
-                c.execute('UPDATE pos SET archived=?,invoice_status=? WHERE id=?',(archived,invoice_stage,order['id']))
-                changed+=1
-        special=c.execute("SELECT id FROM pos WHERE number='4300006061'").fetchone()
-        if special:
-            c.execute("UPDATE pos SET region='North',archived=1,value=CASE WHEN COALESCE(value,0)=0 THEN 2083.87 ELSE value END WHERE id=?",(special['id'],))
-            c.execute("UPDATE source_status SET invoice_reference='006' WHERE po_number='4300006061' AND invoice_reference='6'")
-        c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'archive:due_and_region',hashlib.sha256(content).hexdigest()))
+    for order in c.execute('SELECT id,number,status,archived,invoice_status FROM pos').fetchall():
+        number=order['number']
+        if number in conflict and number!='4300006061':continue
+        invoice_stage=order['invoice_status']
+        if number in uploaded and invoice_stage not in ('paid','partially_paid'):
+            invoice_stage='invoiced_up'
+        if number=='4300006061' or number not in mentioned or invoice_stage in ('invoiced_up','paid','partially_paid') and number in uploaded:
+            archived=1
+        elif number in active:
+            archived=int(invoice_stage in ('invoiced_up','paid'))
+        else:
+            archived=order['archived']
+        if (archived,invoice_stage)!=(order['archived'],order['invoice_status']):
+            c.execute('UPDATE pos SET archived=?,invoice_status=? WHERE id=?',(archived,invoice_stage,order['id']))
+            changed+=1
+    special=c.execute("SELECT id FROM pos WHERE number='4300006061'").fetchone()
+    if special:
+        c.execute("UPDATE pos SET region='North',archived=1,value=CASE WHEN COALESCE(value,0)=0 THEN 2083.87 ELSE value END WHERE id=?",(special['id'],))
+        c.execute("UPDATE source_status SET invoice_reference='006' WHERE po_number='4300006061' AND invoice_reference='6'")
+    c.execute('INSERT INTO audit(user_id,action,target) VALUES(?,?,?)',(request.state.user['id'],'archive:due_and_region',hashlib.sha256(content).hexdigest()))
     return {'changed':changed,'conflicts':sorted(conflict),'backup_id':backup}

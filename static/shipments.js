@@ -65,17 +65,15 @@ function paymentIntake(){
     ${lastAdviceBatch?`<a class="button secondary" href="/api/payment-advice/${lastAdviceBatch}">Download payment report</a>`:''}</section>`;
 }
 function documentIntake(){
-  return `<section class="card"><h3>Document upload</h3><input type="file" accept=".pdf,.png,.jpg,.jpeg" onchange="uploadIntake(this,'document-intake')" aria-label="Upload document">
-    <div id="document-upload-result" aria-live="polite"></div><details ontoggle="if(this.open)loadDocumentReview()"><summary>Files needing review</summary><div id="document-review-list"></div></details></section>
-    ${user.is_admin?`<details class="card"><summary>Apply Due and Region archive rules</summary><p>Uses this workbook to update archive status and creates a backup first.</p>
-    <input type="file" accept=".xlsx" onchange="uploadIntake(this,'due-region-archive')" aria-label="Due and Region archive workbook"></details>`:''}`;
+  const types=['GR','MRR','RCV','ASN','Invoice','PO','Rejection Form','Delivery Note','Other'];
+  return `<section class="card"><h3>${bilingual('Upload Document','رفع مستند')}</h3><label>Document type<select id="intake-kind" onchange="document.getElementById('intake-file').disabled=!this.value">${choices([['','Choose document type'],...types.map(t=>[t,t])])}</select></label><input id="intake-file" disabled type="file" accept=".pdf,.png,.jpg,.jpeg" onchange="uploadIntake(this,'document-intake')"><div id="document-upload-result" role="status"></div><details ontoggle="if(this.open)loadDocumentReview()"><summary>Files needing review</summary><div id="document-review-list"></div></details></section>`;
 }
 async function uploadIntake(input,path){
   const file=input.files[0];
   if(!file)return;
   if(path==='due-region-archive'&&!confirm('Apply archive rules using this Due and Region workbook?')){input.value='';return}
   input.disabled=true;
-  const payload=new FormData();payload.set('file',file);
+  const payload=new FormData();payload.set('file',file);if(path==='document-intake')payload.set('document_type',document.getElementById('intake-kind').value);
   try{
     const response=await api(path,'POST',payload);
     if(path==='payment-advice'){lastAdviceBatch=response.batch_id;await refresh();toast(`${response.posted} receipts posted`)}

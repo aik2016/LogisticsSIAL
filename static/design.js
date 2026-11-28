@@ -93,3 +93,22 @@ function enhanceTables(){
     draw();
   });
 }
+
+function insightBars(title, measures, unit=''){
+  const values=measures.map(([label,value])=>[label,Math.max(0,Number(value)||0)]);
+  if(!values.length)return '';
+  const max=Math.max(1,...values.map(([,value])=>value));
+  return `<section class="card"><h3>${esc(title)}</h3><ul class="insight-list">
+    ${values.map(([label,value])=>`<li title="${esc(label)} · ${fmt(value)} ${esc(unit)}">
+      <span>${esc(label)}</span><span class="chart-track" aria-hidden="true"><span style="--bar:${100*value/max}%;--delay:0ms"></span></span>
+      <strong>${fmt(value)} ${esc(unit)}</strong></li>`).join('')}</ul></section>`;
+}
+function stockInsight(stock){
+  const item=stock.find(row=>row.code===inventorySelected);
+  if(!item)return '';
+  return insightBars(item.code,[[tr('total'),item.physical],[tr('booked'),item.booked],[tr('free'),item.free]],bilingual('pcs','قطعة'));
+}
+function invoiceInsight(){
+  const items=report.invoice_status||[];
+  return insightBars(bilingual('Invoices by status','الفواتير حسب الحالة'),items.map(row=>[st(row.status),row.count]));
+}

@@ -99,7 +99,7 @@ async function saveProblem(event,id){
   event.preventDefault();
   const payload=Object.fromEntries(new FormData(event.target));
   payload.impact=payload.impact===''?null:Number(payload.impact);
-  try{await api(id?'problems/'+id:'problems',id?'PUT':'POST',payload);await loadProblemSummary();problemsView();toast(tr('save'))}
+  try{await api(id?'problems/'+id:'problems',id?'PUT':'POST',payload);await loadProblemSummary();render();toast(tr('save'))}
   catch(error){toast(error.message)}
 }
 async function loadProblemHistory(id){
@@ -124,4 +124,15 @@ async function importPaymentEvidence(event){
     await loadProblemSummary();problemsView();
     toast(bilingual('New discrepancies','فروقات جديدة')+' · '+fmt(result.problems_created));
   }catch(error){toast(error.message)}
+}
+
+function poProblemHistory(po){
+  if(!can('issue_edit')||user.role==='warehouse')return '';
+  const records=problemData.problems.filter(problem=>problem.po_id===po.id);
+  if(!records.length)return '';
+  return `<section class="card"><h3>${bilingual('PO problems','مشكلات أمر الشراء')}</h3>${records.map(problem=>`
+    <details class="inline-problem" ontoggle="if(this.open)loadProblemHistory(${problem.id})">
+      <summary>${problemLabel('category',problem.category)} · ${problemLabel('status',problem.status)}</summary>
+      <p>${esc(problem.remarks)}</p>${problemForm(problem)}<div id="problem-history-${problem.id}"></div>
+    </details>`).join('')}</section>`;
 }

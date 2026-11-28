@@ -253,7 +253,7 @@ class Task(BaseModel):
     details: str = ''
 
 
-RELEASE='20261126-staging.1'
+RELEASE='20261128-staging.2'
 
 @app.get('/release')
 def release():
@@ -379,7 +379,7 @@ def dashboard_data():
                 po['delivered_qty']=max(0,po['delivered_qty']-returned)
         return {'pos':pos,'stock':stock,'batches':batch_rows, 'invoices':invoices,
                 'issues':rows(c,'SELECT * FROM issues ORDER BY id DESC'), 'tasks':rows(c,'SELECT * FROM tasks ORDER BY id DESC'),
-                'lines':rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date'),
+                'lines':[dict(line,outstanding_qty=remaining.get(line['id'])) for line in rows(c,'SELECT l.*,p.number po_number,i.pcs_per_box,i.boxes_per_pallet FROM po_lines l JOIN pos p ON p.id=l.po_id JOIN items i ON i.code=l.item_code ORDER BY l.due_date')],
                 'reminders':reminders, 'urgent':urgent,
                 'documents':rows(c,'SELECT d.id,d.po_id,d.filename,d.document_type,d.uploaded_at FROM po_documents d ORDER BY d.id DESC'),
                 'regional_rows':region_rows,
